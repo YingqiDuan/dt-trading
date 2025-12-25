@@ -67,6 +67,24 @@ train:
   log_dir: outputs/train
   checkpoint_dir: outputs/checkpoints
 
+rl:
+  action_mode: discrete  # discrete|continuous
+  action_dim: 1
+  rollout_steps: 2048
+  ppo_epochs: 4
+  minibatch_size: 256
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  value_coef: 0.5
+  entropy_coef: 0.01
+  episode_len: 512  # null = full window
+  reward_scale: 1.0
+  turnover_penalty: 0.0
+  position_penalty: 0.0
+  drawdown_penalty: 0.0
+  eval_every: 1
+
 backtest:
   initial_cash: 10000
   fee: 0.0004
@@ -91,6 +109,7 @@ papertrade:
 
 walk_forward:
   enabled: false  # true|false
+  mode: bc  # bc|rl
   train_bars: 4320
   val_bars: 720
   test_bars: 720

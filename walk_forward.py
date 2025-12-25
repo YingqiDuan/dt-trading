@@ -16,11 +16,18 @@ from dataset_builder import (
 )
 from dt_model import DecisionTransformer
 from features import build_features
+from market_env import MarketEnv
 from train_dt import (
+    collect_rollout,
+    evaluate_policy,
+    ppo_update,
+    select_device as select_device_rl,
+)
+from train_dt_bc import (
     TrajectoryDataset,
     compute_class_weights,
     eval_epoch,
-    select_device,
+    select_device as select_device_bc,
     train_epoch,
 )
 from utils import ensure_dir, load_config, rtg_quantile_from_dataset, save_json, set_seed
@@ -90,7 +97,7 @@ def train_for_fold(cfg, train_path, val_path, fold_dir):
     train_ds = TrajectoryDataset(train_path, cfg["dataset"]["seq_len"])
     val_ds = TrajectoryDataset(val_path, cfg["dataset"]["seq_len"])
 
-    device = select_device(cfg["train"]["device"])
+    device = select_device_bc(cfg["train"]["device"])
     state_dim = train_ds.states.shape[1]
     act_dim = 3
 
@@ -237,6 +244,154 @@ def train_for_fold(cfg, train_path, val_path, fold_dir):
     ckpt = torch.load(best_path, map_location=device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
+    model.condition_mode = ckpt.get("model_config", {}).get("condition_mode", "rtg")
+    return model, best_path, log_rows
+
+
+def train_for_fold_rl(cfg, train_df, val_df, state_cols, fold_dir, fold_seed):
+    device = select_device_rl(cfg["train"]["device"])
+    action_mode = str(cfg["rl"].get("action_mode", "discrete")).lower()
+    act_dim = int(cfg["rl"].get("action_dim", 1)) if action_mode == "continuous" else 3
+    if action_mode == "continuous" and act_dim != 1:
+        raise ValueError("continuous action_mode currently supports action_dim=1")
+
+    model = DecisionTransformer(
+        state_dim=len(state_cols),
+        act_dim=act_dim,
+        seq_len=cfg["dataset"]["seq_len"],
+        d_model=cfg["train"]["d_model"],
+        n_layers=cfg["train"]["n_layers"],
+        n_heads=cfg["train"]["n_heads"],
+        dropout=cfg["train"]["dropout"],
+        action_mode=action_mode,
+        use_value_head=True,
+    ).to(device)
+    model.condition_mode = "reward"
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg["train"]["lr"],
+        weight_decay=cfg["train"]["weight_decay"],
+    )
+
+    episode_len = cfg["rl"].get("episode_len", None)
+    if episode_len is not None:
+        episode_len = int(episode_len)
+        if episode_len >= len(train_df):
+            episode_len = len(train_df) - 1
+        if episode_len <= 0:
+            raise ValueError("episode_len too small for walk-forward fold")
+
+    train_env = MarketEnv(
+        states=train_df[state_cols].to_numpy(dtype=np.float32),
+        close=train_df["close"].to_numpy(dtype=np.float32),
+        timestamps=train_df["timestamp"].to_numpy(dtype=np.int64),
+        fee=cfg["rewards"]["fee"],
+        slip=cfg["rewards"]["slip"],
+        episode_len=episode_len,
+        reward_scale=cfg["rl"].get("reward_scale", 1.0),
+        turnover_penalty=cfg["rl"].get("turnover_penalty", 0.0),
+        position_penalty=cfg["rl"].get("position_penalty", 0.0),
+        drawdown_penalty=cfg["rl"].get("drawdown_penalty", 0.0),
+        action_mode=action_mode,
+        rng=np.random.RandomState(fold_seed),
+    )
+
+    rollout_steps = int(cfg["rl"].get("rollout_steps", 2048))
+    gamma = float(cfg["rl"].get("gamma", 0.99))
+    gae_lambda = float(cfg["rl"].get("gae_lambda", 0.95))
+    eval_every = int(cfg["rl"].get("eval_every", 1))
+    has_val = eval_every > 0 and not val_df.empty
+
+    log_rows = []
+    best_val = -float("inf")
+    best_path = os.path.join(fold_dir, "dt_best.pt")
+
+    for epoch in range(1, cfg["train"]["epochs"] + 1):
+        buffer = collect_rollout(
+            train_env,
+            model,
+            device,
+            cfg["dataset"]["seq_len"],
+            action_mode,
+            act_dim,
+            rollout_steps,
+            gamma,
+            gae_lambda,
+        )
+
+        policy_loss, value_loss, entropy, approx_kl, clip_frac = ppo_update(
+            model, optimizer, buffer, device, cfg, action_mode
+        )
+
+        mean_ep_return = float(np.mean(buffer["ep_returns"])) if buffer["ep_returns"] else 0.0
+        mean_ep_len = float(np.mean(buffer["ep_lengths"])) if buffer["ep_lengths"] else 0.0
+
+        val_metrics = None
+        improved = False
+        if has_val and epoch % eval_every == 0:
+            val_metrics = evaluate_policy(
+                cfg, model, val_df, state_cols, device, action_mode, act_dim
+            )
+            if val_metrics and val_metrics["total_return"] > best_val:
+                best_val = val_metrics["total_return"]
+                improved = True
+        elif not has_val and mean_ep_return > best_val:
+            best_val = mean_ep_return
+            improved = True
+
+        if improved:
+            ckpt = {
+                "model_state": model.state_dict(),
+                "model_config": {
+                    "state_dim": len(state_cols),
+                    "act_dim": act_dim,
+                    "seq_len": cfg["dataset"]["seq_len"],
+                    "d_model": cfg["train"]["d_model"],
+                    "n_layers": cfg["train"]["n_layers"],
+                    "n_heads": cfg["train"]["n_heads"],
+                    "dropout": cfg["train"]["dropout"],
+                    "action_mode": action_mode,
+                    "use_value_head": True,
+                    "condition_mode": "reward",
+                },
+            }
+            torch.save(ckpt, best_path)
+
+        log_row = {
+            "epoch": epoch,
+            "policy_loss": policy_loss,
+            "value_loss": value_loss,
+            "entropy": entropy,
+            "approx_kl": approx_kl,
+            "clip_frac": clip_frac,
+            "mean_episode_return": mean_ep_return,
+            "mean_episode_len": mean_ep_len,
+        }
+        if val_metrics is not None:
+            log_row.update(
+                {
+                    "val_total_return": val_metrics["total_return"],
+                    "val_sharpe": val_metrics["sharpe"],
+                    "val_max_drawdown": val_metrics["max_drawdown"],
+                }
+            )
+
+        log_rows.append(log_row)
+
+        print(
+            f"epoch {epoch}: policy_loss={policy_loss:.4f} value_loss={value_loss:.4f} "
+            f"entropy={entropy:.4f} mean_ep_return={mean_ep_return:.4f}"
+        )
+
+    log_path = os.path.join(fold_dir, "training_log.json")
+    save_json(log_path, log_rows)
+
+    if os.path.exists(best_path):
+        ckpt = torch.load(best_path, map_location=device)
+        model.load_state_dict(ckpt["model_state"], strict=False)
+    model.eval()
+    model.condition_mode = "reward"
     return model, best_path, log_rows
 
 
@@ -249,6 +404,9 @@ def main():
     wf_cfg = cfg.get("walk_forward", {})
     if not wf_cfg.get("enabled", False):
         raise SystemExit("walk_forward.enabled is false; enable it in config.yaml")
+    mode = str(wf_cfg.get("mode", "bc")).lower()
+    if mode not in ("bc", "rl"):
+        raise ValueError("walk_forward.mode must be 'bc' or 'rl'")
 
     train_bars = int(wf_cfg.get("train_bars", 0))
     val_bars = int(wf_cfg.get("val_bars", 0))
@@ -275,7 +433,7 @@ def main():
     total_len = len(feat_df)
     start_idx = 0
     fold_idx = 0
-    summary = {"folds": []}
+    summary = {"folds": [], "mode": mode}
 
     while True:
         train_end = start_idx + train_bars
@@ -293,32 +451,50 @@ def main():
         if len(train_df) < cfg["dataset"]["seq_len"] or len(val_df) < cfg["dataset"]["seq_len"]:
             raise ValueError("train/val window shorter than seq_len")
 
-        rng = np.random.RandomState(cfg["behavior_policies"].get("seed", 42) + fold_idx)
-        train_data = build_mixed_dataset(train_df, state_cols, cfg, rng)
-        val_data = build_mixed_dataset(val_df, state_cols, cfg, rng)
-
-        train_path = os.path.join(fold_dir, "train_dataset.npz")
-        val_path = os.path.join(fold_dir, "val_dataset.npz")
-        save_dataset(train_path, train_data, state_cols)
-        save_dataset(val_path, val_data, state_cols)
-
         print(f"fold {fold_idx}: train={len(train_df)} val={len(val_df)} test={len(test_df)}")
-        model, ckpt_path, _ = train_for_fold(cfg, train_path, val_path, fold_dir)
+        if mode == "bc":
+            rng = np.random.RandomState(cfg["behavior_policies"].get("seed", 42) + fold_idx)
+            train_data = build_mixed_dataset(train_df, state_cols, cfg, rng)
+            val_data = build_mixed_dataset(val_df, state_cols, cfg, rng)
 
-        inference_rtg = resolve_fold_inference_rtg(cfg, train_path)
-        device = next(model.parameters()).device
-        curve, equity, step_returns, trade_count, turnover, _ = run_model_backtest(
-            cfg, model, test_df, state_cols, device, inference_rtg
-        )
+            train_path = os.path.join(fold_dir, "train_dataset.npz")
+            val_path = os.path.join(fold_dir, "val_dataset.npz")
+            save_dataset(train_path, train_data, state_cols)
+            save_dataset(val_path, val_data, state_cols)
+
+            model, ckpt_path, _ = train_for_fold(cfg, train_path, val_path, fold_dir)
+
+            inference_rtg = resolve_fold_inference_rtg(cfg, train_path)
+            device = next(model.parameters()).device
+            curve, equity, step_returns, trade_count, turnover, _ = run_model_backtest(
+                cfg, model, test_df, state_cols, device, inference_rtg
+            )
+        else:
+            fold_seed = int(cfg["behavior_policies"].get("seed", 42)) + fold_idx
+            model, ckpt_path, _ = train_for_fold_rl(
+                cfg, train_df, val_df, state_cols, fold_dir, fold_seed
+            )
+            device = next(model.parameters()).device
+            curve, equity, step_returns, trade_count, turnover, _ = run_model_backtest(
+                cfg, model, test_df, state_cols, device
+            )
 
         annual_factor = 24 * 365
         dt_metrics = compute_metrics(
             equity, step_returns, trade_count, turnover, annual_factor
         )
-        dt_metrics["action_distribution"] = action_distribution(
-            curve["action"].to_numpy(dtype=np.int64)
-        )
-        dt_metrics["inference_rtg"] = float(inference_rtg)
+        if model.action_mode == "continuous":
+            actions = curve["action"].to_numpy(dtype=np.float32)
+            dt_metrics["action_stats"] = {
+                "mean_position": float(np.mean(actions)),
+                "mean_abs_position": float(np.mean(np.abs(actions))),
+            }
+        else:
+            dt_metrics["action_distribution"] = action_distribution(
+                curve["action"].to_numpy(dtype=np.int64)
+            )
+        if mode == "bc":
+            dt_metrics["inference_rtg"] = float(inference_rtg)
 
         metrics_path = os.path.join(fold_dir, "metrics.json")
         curve_path = os.path.join(fold_dir, "equity_curve.csv")

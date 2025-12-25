@@ -30,6 +30,14 @@ def to_ms(dt):
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
+    try:
+        import torch
+
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    except Exception:
+        pass
 
 
 def rolling_zscore(series, window):

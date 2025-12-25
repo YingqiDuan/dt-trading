@@ -1,6 +1,6 @@
 # DT Trading MVP
 
-Minimal, end-to-end pipeline for: data -> features -> trajectories -> Decision Transformer -> backtest -> paper trade.
+Minimal, end-to-end pipeline for: data -> features -> Decision Transformer (PPO RL) -> backtest -> paper trade.
 
 ## Quick Start
 
@@ -10,13 +10,13 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-1) Build dataset (fetch + features + trajectories)
+1) Fetch data + build features (optional, caches OHLCV + features)
 
 ```bash
 python dataset_builder.py --config config.yaml --force
 ```
 
-2) Train
+2) Train (PPO on historical market environment)
 
 ```bash
 python train_dt.py --config config.yaml
@@ -43,12 +43,13 @@ python walk_forward.py --config config.yaml
 
 ## Project Structure
 
-- `dataset_builder.py`: fetch OHLCV, build features, generate trajectories
-- `train_dt.py`: train Decision Transformer (class-weighted CE, macro-F1/recall)
+- `dataset_builder.py`: fetch OHLCV, build features, generate trajectories (optional for caching)
+- `train_dt.py`: train Decision Transformer policy with PPO on historical market env
 - `backtest.py`: vectorized backtest with friction + baselines
 - `papertrade.py`: Binance USDT-M futures paper trading loop
-- `walk_forward.py`: rolling train/val/test training + evaluation
+- `walk_forward.py`: rolling train/val/test training + evaluation (BC or PPO via `walk_forward.mode`)
 - `dt_model.py`: transformer model
+- `market_env.py`: step-by-step historical market environment for RL rollouts
 - `features.py`: feature engineering
 - `config.yaml`: end-to-end config
 
@@ -65,18 +66,18 @@ python walk_forward.py --config config.yaml
 
 ## Key Notes
 
-- Return-to-go is conditioned during inference; see `backtest.inference_rtg` and `rtg_quantile_scope` in `config.yaml`.
+- Reward history is conditioned during inference (previous step reward at the current state).
 - Window start uses previous action to avoid transaction-cost bias at sequence boundaries.
 - Paper trading uses mainnet URL by default (`https://fapi.binance.com`). Keep `papertrade.dry_run: true` unless you want real orders.
 - Metrics include action distribution in `outputs/backtest/metrics.json`.
 
 ## Config Tips
 
-- `train.sampling`: `uniform | rtg | episode_return` for weighted sequence sampling.
-- `train.use_class_weights`: `true | false` to toggle class-weighted loss.
-- `train.use_sampling`: `true | false` to toggle weighted sampling.
-- `backtest.inference_rtg`: set to a float for fixed target return; `"auto"` uses a RTG quantile.
+- `rl.action_mode`: `discrete | continuous` (continuous uses tanh-squashed Gaussian, action_dim=1).
+- `rl.rollout_steps`, `rl.ppo_epochs`, `rl.minibatch_size`: PPO sampling + update schedule.
+- `rl.gamma`, `rl.gae_lambda`, `rl.clip_range`: PPO advantage/clip settings.
 - `papertrade.base_url`: `https://fapi.binance.com | https://demo-fapi.binance.com`.
+- `walk_forward.mode`: `bc | rl` to choose behavior-cloning or PPO for each fold.
 - `walk_forward.*`: rolling window sizes in bars; outputs to `outputs/walk_forward/`.
 
 ## Environment Variables

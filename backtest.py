@@ -30,7 +30,7 @@ def find_latest_checkpoint(ckpt_dir):
 
 
 def simulate(actions, close, fee, slip, initial_cash):
-    actions = actions.astype(np.int64)
+    actions = np.asarray(actions, dtype=np.float32).reshape(-1)
     delta = np.diff(np.concatenate(([0], actions)))
     returns = close[1:] / close[:-1] - 1.0
     step_returns = np.zeros_like(actions, dtype=np.float32)
@@ -91,48 +91,79 @@ def action_distribution(actions):
 
 def run_model_backtest(cfg, model, df, state_cols, device, inference_rtg_override=None):
     seq_len = cfg["dataset"]["seq_len"]
-    inference_rtg = (
-        float(inference_rtg_override)
-        if inference_rtg_override is not None
-        else resolve_inference_rtg(cfg)
-    )
     fee = cfg["backtest"]["fee"]
     slip = cfg["backtest"]["slip"]
+    action_mode = getattr(model, "action_mode", "discrete")
+    condition_mode = getattr(model, "condition_mode", "reward")
+    inference_rtg = None
 
     states = df[state_cols].to_numpy(dtype=np.float32)
     close = df["close"].to_numpy(dtype=np.float32)
     timestamps = df["timestamp"].to_numpy(dtype=np.int64)
 
-    actions = np.zeros(len(df), dtype=np.int64)
-    rtg_hist = np.zeros(len(df), dtype=np.float32)
-    rtg_hist[0] = inference_rtg
-    prev_action = 0
+    if action_mode == "continuous":
+        actions = np.zeros(len(df), dtype=np.float32)
+    else:
+        actions = np.zeros(len(df), dtype=np.int64)
+    rewards_hist = np.zeros(len(df), dtype=np.float32)
+    rtg_hist = None
+    if condition_mode == "rtg":
+        inference_rtg = (
+            float(inference_rtg_override)
+            if inference_rtg_override is not None
+            else resolve_inference_rtg(cfg)
+        )
+        rtg_hist = np.zeros(len(df), dtype=np.float32)
+        rtg_hist[0] = inference_rtg
+    step_rewards = np.zeros(len(df), dtype=np.float32)
+    prev_action = 0.0
     for idx in range(len(df)):
         if idx < seq_len:
-            actions[idx] = 0
+            action = 0.0 if action_mode == "continuous" else 0
         else:
             state_window = states[idx - seq_len + 1 : idx + 1]
             actions_window = actions[idx - seq_len + 1 : idx + 1]
-            actions_in = np.zeros(seq_len, dtype=np.int64)
-            window_prev_action = actions[idx - seq_len] if idx - seq_len >= 0 else 0
-            actions_in[0] = window_prev_action
-            actions_in[1:] = actions_window[:-1]
-            rtg_window = rtg_hist[idx - seq_len + 1 : idx + 1]
+            reward_window = rewards_hist[idx - seq_len + 1 : idx + 1]
+            rtg_window = None
+            if condition_mode == "rtg":
+                rtg_window = rtg_hist[idx - seq_len + 1 : idx + 1]
 
             with torch.no_grad():
                 s = torch.tensor(state_window, device=device).unsqueeze(0)
-                a = torch.tensor(action_to_index(actions_in), device=device).unsqueeze(0)
-                rtg = torch.tensor(rtg_window, device=device).unsqueeze(0)
-                logits = model(s, a, rtg)
-                action_idx = int(torch.argmax(logits[0, -1]).item())
-                actions[idx] = index_to_action(action_idx)
+                if condition_mode == "rtg":
+                    r = torch.tensor(rtg_window, device=device).unsqueeze(0)
+                else:
+                    r = torch.tensor(reward_window, device=device).unsqueeze(0)
+                if action_mode == "continuous":
+                    actions_in = np.zeros((seq_len, 1), dtype=np.float32)
+                    window_prev_action = actions[idx - seq_len] if idx - seq_len >= 0 else 0.0
+                    actions_in[0, 0] = float(window_prev_action)
+                    actions_in[1:, 0] = actions_window[:-1]
+                    a = torch.tensor(actions_in, device=device).unsqueeze(0)
+                    logits = model(s, a, r)
+                    mean = logits[0, -1]
+                    action = float(torch.tanh(mean).cpu().numpy().item())
+                else:
+                    actions_in = np.zeros(seq_len, dtype=np.int64)
+                    window_prev_action = actions[idx - seq_len] if idx - seq_len >= 0 else 0
+                    actions_in[0] = int(window_prev_action)
+                    actions_in[1:] = actions_window[:-1]
+                    a = torch.tensor(action_to_index(actions_in), device=device).unsqueeze(0)
+                    logits = model(s, a, r)
+                    action_idx = int(torch.argmax(logits[0, -1]).item())
+                    action = int(index_to_action(action_idx))
 
+        actions[idx] = action
         if idx < len(df) - 1:
             ret = close[idx + 1] / close[idx] - 1.0
-            trade_cost = (fee + slip) * abs(actions[idx] - prev_action)
-            reward = actions[idx] * ret - trade_cost
-            rtg_hist[idx + 1] = rtg_hist[idx] - reward
-        prev_action = actions[idx]
+            trade_cost = (fee + slip) * abs(action - prev_action)
+            reward = action * ret - trade_cost
+            if condition_mode == "rtg":
+                rtg_hist[idx + 1] = rtg_hist[idx] - reward
+            else:
+                rewards_hist[idx + 1] = reward
+            step_rewards[idx] = reward
+        prev_action = action
 
     equity, step_returns, trade_count, turnover = simulate(
         actions,
@@ -147,11 +178,13 @@ def run_model_backtest(cfg, model, df, state_cols, device, inference_rtg_overrid
             "timestamp": timestamps,
             "close": close,
             "action": actions,
-            "rtg": rtg_hist,
+            "reward": step_rewards,
             "equity": equity,
             "step_return": step_returns,
         }
     )
+    if condition_mode == "rtg":
+        curve["rtg"] = rtg_hist
 
     return curve, equity, step_returns, trade_count, turnover, inference_rtg
 
@@ -190,9 +223,12 @@ def main():
         n_layers=model_cfg["n_layers"],
         n_heads=model_cfg["n_heads"],
         dropout=model_cfg["dropout"],
+        action_mode=model_cfg.get("action_mode", "discrete"),
+        use_value_head=bool(model_cfg.get("use_value_head", False)),
     ).to(device)
-    model.load_state_dict(ckpt["model_state"])
+    model.load_state_dict(ckpt["model_state"], strict=False)
     model.eval()
+    model.condition_mode = model_cfg.get("condition_mode", "reward")
 
     curve, equity, step_returns, trade_count, turnover, inference_rtg = run_model_backtest(
         cfg, model, test_df, state_cols, device
@@ -200,10 +236,20 @@ def main():
 
     annual_factor = 24 * 365
     dt_metrics = compute_metrics(equity, step_returns, trade_count, turnover, annual_factor)
-    dt_metrics["action_distribution"] = action_distribution(curve["action"].to_numpy(dtype=np.int64))
-    dt_metrics["inference_rtg"] = float(inference_rtg)
+    if model.action_mode == "continuous":
+        actions = curve["action"].to_numpy(dtype=np.float32)
+        dt_metrics["action_stats"] = {
+            "mean_position": float(np.mean(actions)),
+            "mean_abs_position": float(np.mean(np.abs(actions))),
+        }
+    else:
+        dt_metrics["action_distribution"] = action_distribution(
+            curve["action"].to_numpy(dtype=np.int64)
+        )
+        print(f"decision_transformer action_distribution: {dt_metrics['action_distribution']}")
+    if model.condition_mode == "rtg" and inference_rtg is not None:
+        dt_metrics["inference_rtg"] = float(inference_rtg)
     metrics = {"decision_transformer": dt_metrics}
-    print(f"decision_transformer action_distribution: {dt_metrics['action_distribution']}")
 
     close = test_df["close"].to_numpy(dtype=np.float32)
     ema_actions = np.where(

@@ -35,9 +35,12 @@ def load_checkpoint(ckpt_path):
         n_layers=cfg["n_layers"],
         n_heads=cfg["n_heads"],
         dropout=cfg["dropout"],
+        action_mode=cfg.get("action_mode", "discrete"),
+        use_value_head=bool(cfg.get("use_value_head", False)),
     )
-    model.load_state_dict(ckpt["model_state"])
+    model.load_state_dict(ckpt["model_state"], strict=False)
     model.eval()
+    model.condition_mode = cfg.get("condition_mode", "reward")
     return model
 
 
@@ -156,10 +159,12 @@ def append_log(path, row):
     df.to_csv(path, mode="a", header=not os.path.exists(path), index=False)
 
 
-def run_cycle(cfg, model, device, log_path, inference_rtg):
+def run_cycle(cfg, model, device, log_path):
     api_key = os.getenv(cfg["papertrade"]["api_key_env"], "")
     api_secret = os.getenv(cfg["papertrade"]["api_secret_env"], "")
     client = BinanceFuturesClient(cfg["papertrade"]["base_url"], api_key, api_secret)
+    action_mode = getattr(model, "action_mode", "discrete")
+    condition_mode = getattr(model, "condition_mode", "reward")
 
     seq_len = cfg["dataset"]["seq_len"]
     ema_windows = [int(w) for w in cfg["features"].get("ema_windows", [])]
@@ -207,46 +212,91 @@ def run_cycle(cfg, model, device, log_path, inference_rtg):
 
     state_window = feat_df[state_cols].tail(seq_len).to_numpy(dtype=np.float32)
     recent_logs = load_recent_logs(log_path, seq_len + 1)
-    action_hist = (
-        recent_logs["action"].astype(int).tolist() if not recent_logs.empty and "action" in recent_logs else []
+    if not recent_logs.empty and "action" in recent_logs:
+        if action_mode == "continuous":
+            action_hist = recent_logs["action"].astype(float).tolist()
+        else:
+            action_hist = recent_logs["action"].astype(int).tolist()
+    else:
+        action_hist = []
+    reward_hist = (
+        recent_logs["reward"].astype(float).tolist()
+        if not recent_logs.empty and "reward" in recent_logs
+        else []
     )
     rtg_hist = (
-        recent_logs["rtg"].astype(float).tolist() if not recent_logs.empty and "rtg" in recent_logs else []
+        recent_logs["rtg"].astype(float).tolist()
+        if not recent_logs.empty and "rtg" in recent_logs
+        else []
     )
 
-    actions_in = np.zeros(seq_len, dtype=np.int64)
-    if action_hist:
-        hist = action_hist[-(seq_len - 1) :]
-        actions_in[-len(hist) :] = hist
-        if len(action_hist) >= seq_len:
-            actions_in[0] = int(action_hist[-seq_len])
+    if action_mode == "continuous":
+        actions_in = np.zeros((seq_len, 1), dtype=np.float32)
+        if action_hist:
+            hist = action_hist[-(seq_len - 1) :]
+            actions_in[-len(hist) :, 0] = hist
+            if len(action_hist) >= seq_len:
+                actions_in[0, 0] = float(action_hist[-seq_len])
+    else:
+        actions_in = np.zeros(seq_len, dtype=np.int64)
+        if action_hist:
+            hist = action_hist[-(seq_len - 1) :]
+            actions_in[-len(hist) :] = hist
+            if len(action_hist) >= seq_len:
+                actions_in[0] = int(action_hist[-seq_len])
 
-    current_rtg = inference_rtg
-    if last_log is not None:
-        prev_rtg = float(last_log.get("rtg", inference_rtg))
-        prev_close = float(last_log.get("close", last_row["close"]))
-        prev_action = int(last_log.get("action", 0))
-        prev_prev_action = 0
-        if len(action_hist) >= 2:
-            prev_prev_action = int(action_hist[-2])
-        ret = float(last_row["close"]) / prev_close - 1.0
-        trade_cost = (cfg["backtest"]["fee"] + cfg["backtest"]["slip"]) * abs(prev_action - prev_prev_action)
-        reward = prev_action * ret - trade_cost
-        current_rtg = prev_rtg - reward
+    current_reward = 0.0
+    current_rtg = None
+    if condition_mode == "rtg":
+        inference_rtg = resolve_inference_rtg(cfg)
+        current_rtg = inference_rtg
+        if last_log is not None:
+            prev_rtg = float(last_log.get("rtg", inference_rtg))
+            prev_close = float(last_log.get("close", last_row["close"]))
+            prev_action = float(last_log.get("action", 0.0))
+            prev_prev_action = float(action_hist[-2]) if len(action_hist) >= 2 else 0.0
+            ret = float(last_row["close"]) / prev_close - 1.0
+            trade_cost = (cfg["backtest"]["fee"] + cfg["backtest"]["slip"]) * abs(
+                prev_action - prev_prev_action
+            )
+            current_reward = prev_action * ret - trade_cost
+            current_rtg = prev_rtg - current_reward
 
-    rtg_window = np.full(seq_len, current_rtg, dtype=np.float32)
-    if rtg_hist:
-        hist = rtg_hist[-(seq_len - 1) :]
-        start = seq_len - 1 - len(hist)
-        rtg_window[start : seq_len - 1] = hist
+        reward_window = np.full(seq_len, current_rtg, dtype=np.float32)
+        if rtg_hist:
+            hist = rtg_hist[-(seq_len - 1) :]
+            start = seq_len - 1 - len(hist)
+            reward_window[start : seq_len - 1] = hist
+    else:
+        if last_log is not None:
+            prev_close = float(last_log.get("close", last_row["close"]))
+            prev_action = float(last_log.get("action", 0.0))
+            prev_prev_action = float(action_hist[-2]) if len(action_hist) >= 2 else 0.0
+            ret = float(last_row["close"]) / prev_close - 1.0
+            trade_cost = (cfg["backtest"]["fee"] + cfg["backtest"]["slip"]) * abs(
+                prev_action - prev_prev_action
+            )
+            current_reward = prev_action * ret - trade_cost
+
+        reward_window = np.zeros(seq_len, dtype=np.float32)
+        if reward_hist:
+            hist = reward_hist[-(seq_len - 1) :]
+            start = seq_len - 1 - len(hist)
+            reward_window[start : seq_len - 1] = hist
+        reward_window[-1] = current_reward
 
     with torch.no_grad():
         s = torch.tensor(state_window, device=device).unsqueeze(0)
-        a = torch.tensor(action_to_index(actions_in), device=device).unsqueeze(0)
-        rtg = torch.tensor(rtg_window, device=device).unsqueeze(0)
-        logits = model(s, a, rtg)
-        action_idx = int(torch.argmax(logits[0, -1]).item())
-        action = int(index_to_action(action_idx))
+        r = torch.tensor(reward_window, device=device).unsqueeze(0)
+        if action_mode == "continuous":
+            a = torch.tensor(actions_in, device=device).unsqueeze(0)
+            logits = model(s, a, r)
+            action = float(torch.tanh(logits[0, -1]).cpu().numpy().item())
+        else:
+            a = torch.tensor(action_to_index(actions_in), device=device).unsqueeze(0)
+            logits = model(s, a, r)
+            action_idx = int(torch.argmax(logits[0, -1]).item())
+            action = int(index_to_action(action_idx))
 
     features_hash = hashlib.sha256(state_window[-1].tobytes()).hexdigest()
     dry_run = cfg["papertrade"]["dry_run"]
@@ -309,7 +359,6 @@ def run_cycle(cfg, model, device, log_path, inference_rtg):
         "action": action,
         "target_position": action,
         "position": action,
-        "rtg": float(current_rtg),
         "position_qty": float(current_qty),
         "order_side": order_side,
         "equity": equity,
@@ -319,6 +368,10 @@ def run_cycle(cfg, model, device, log_path, inference_rtg):
         "error": error,
         "dry_run": dry_run,
     }
+    if condition_mode == "rtg":
+        log_row["rtg"] = float(current_rtg) if current_rtg is not None else 0.0
+    else:
+        log_row["reward"] = float(current_reward)
 
     append_log(log_path, log_row)
 
@@ -337,17 +390,16 @@ def main():
     cfg = load_config(args.config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = load_checkpoint(args.ckpt).to(device)
-    inference_rtg = resolve_inference_rtg(cfg)
 
     log_path = cfg["papertrade"]["log_path"]
     ensure_dir(os.path.dirname(log_path))
 
     if args.loop:
         while True:
-            run_cycle(cfg, model, device, log_path, inference_rtg)
+            run_cycle(cfg, model, device, log_path)
             time.sleep(cfg["papertrade"]["poll_seconds"])
     else:
-        run_cycle(cfg, model, device, log_path, inference_rtg)
+        run_cycle(cfg, model, device, log_path)
 
 
 if __name__ == "__main__":
