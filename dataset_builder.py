@@ -193,9 +193,7 @@ def main():
         if split_df.empty:
             print(f"split {split_name} has no data")
             continue
-
-    actions_a = policy_ema(split_df, deadzone, ema_window=ema_window)
-
+        actions_a = policy_ema(split_df, deadzone, ema_window=ema_window)
         a_copies = max(1, int(round(mix_ratio * mix_scale))) if mix_ratio > 0 else 0
         b_copies = max(1, mix_scale - a_copies) if mix_ratio < 1 else 0
 
