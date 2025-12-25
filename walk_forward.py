@@ -10,7 +10,7 @@ from dataset_builder import (
     build_dataset,
     concat_datasets,
     load_or_fetch,
-    policy_ma,
+    policy_ema,
     policy_random,
     save_dataset,
 )
@@ -45,12 +45,13 @@ def resolve_fold_inference_rtg(cfg, train_path):
 
 def build_mixed_dataset(split_df, state_cols, cfg, rng):
     deadzone = cfg["behavior_policies"]["ma_deadzone"]
+    ema_window = int(cfg["behavior_policies"].get("ema_window", 18))
     stay_prob = cfg["behavior_policies"]["random_stay_prob"]
     mix_ratio = float(cfg["behavior_policies"].get("mix_ratio", 0.5))
     mix_ratio = max(0.0, min(1.0, mix_ratio))
     mix_scale = 10
 
-    actions_a = policy_ma(split_df, deadzone)
+    actions_a = policy_ema(split_df, deadzone, ema_window=ema_window)
     a_copies = max(1, int(round(mix_ratio * mix_scale))) if mix_ratio > 0 else 0
     b_copies = max(1, mix_scale - a_copies) if mix_ratio < 1 else 0
 
@@ -265,9 +266,11 @@ def main():
 
     set_seed(cfg["behavior_policies"].get("seed", 42))
 
+    ema_window = int(cfg["behavior_policies"].get("ema_window", 18))
+    ema_col = f"ema_{ema_window}"
     raw_df = load_or_fetch(cfg)
     feat_df, state_cols = build_features(raw_df, cfg["features"])
-    feat_df = feat_df.dropna(subset=state_cols + ["ma"]).reset_index(drop=True)
+    feat_df = feat_df.dropna(subset=state_cols + [ema_col]).reset_index(drop=True)
 
     total_len = len(feat_df)
     start_idx = 0

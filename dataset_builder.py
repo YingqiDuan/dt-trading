@@ -71,8 +71,11 @@ def split_by_time(df, train_end, val_end, test_end):
     return train, val, test
 
 
-def policy_ma(df, deadzone):
-    ratio = df["close"] / df["ma"] - 1.0
+def policy_ema(df, deadzone, ema_window=18):
+    ema_col = f"ema_{ema_window}"
+    if ema_col not in df.columns:
+        raise ValueError(f"missing {ema_col} for EMA policy")
+    ratio = df["close"] / df[ema_col] - 1.0
     action = np.where(ratio > deadzone, 1, np.where(ratio < -deadzone, -1, 0))
     return action.astype(np.int64)
 
@@ -152,8 +155,10 @@ def main():
     set_seed(cfg["behavior_policies"].get("seed", 42))
 
     raw_df = load_or_fetch(cfg, force=args.force)
+    ema_window = int(cfg["behavior_policies"].get("ema_window", 18))
+    ema_col = f"ema_{ema_window}"
     feat_df, state_cols = build_features(raw_df, cfg["features"])
-    feat_df = feat_df.dropna(subset=state_cols + ["ma"]).reset_index(drop=True)
+    feat_df = feat_df.dropna(subset=state_cols + [ema_col]).reset_index(drop=True)
 
     train_end = parse_date(cfg["data"]["train_end"])
     val_end = parse_date(cfg["data"].get("val_end", cfg["data"]["train_end"]))
@@ -189,7 +194,7 @@ def main():
             print(f"split {split_name} has no data")
             continue
 
-        actions_a = policy_ma(split_df, deadzone)
+    actions_a = policy_ema(split_df, deadzone, ema_window=ema_window)
 
         a_copies = max(1, int(round(mix_ratio * mix_scale))) if mix_ratio > 0 else 0
         b_copies = max(1, mix_scale - a_copies) if mix_ratio < 1 else 0

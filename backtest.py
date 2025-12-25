@@ -164,8 +164,10 @@ def main():
 
     cfg = load_config(args.config)
     raw_df = load_or_fetch(cfg)
+    ema_window = int(cfg["behavior_policies"].get("ema_window", 18))
+    ema_col = f"ema_{ema_window}"
     feat_df, state_cols = build_features(raw_df, cfg["features"])
-    feat_df = feat_df.dropna(subset=state_cols + ["ma"]).reset_index(drop=True)
+    feat_df = feat_df.dropna(subset=state_cols + [ema_col]).reset_index(drop=True)
 
     train_end = parse_date(cfg["data"]["train_end"])
     val_end = parse_date(cfg["data"].get("val_end", cfg["data"]["train_end"]))
@@ -204,11 +206,11 @@ def main():
     print(f"decision_transformer action_distribution: {dt_metrics['action_distribution']}")
 
     close = test_df["close"].to_numpy(dtype=np.float32)
-    ma_actions = np.where(
-        test_df["close"] / test_df["ma"] - 1.0 > cfg["behavior_policies"]["ma_deadzone"],
+    ema_actions = np.where(
+        test_df["close"] / test_df[ema_col] - 1.0 > cfg["behavior_policies"]["ma_deadzone"],
         1,
         np.where(
-            test_df["close"] / test_df["ma"] - 1.0 < -cfg["behavior_policies"]["ma_deadzone"],
+            test_df["close"] / test_df[ema_col] - 1.0 < -cfg["behavior_policies"]["ma_deadzone"],
             -1,
             0,
         ),
@@ -225,7 +227,7 @@ def main():
 
     for name, actions in [
         ("buy_hold", buy_hold),
-        ("ma_trend", ma_actions),
+        ("ema_trend", ema_actions),
         ("random", rand_actions),
     ]:
         eq, ret, trades, turnover = simulate(

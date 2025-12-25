@@ -162,19 +162,31 @@ def run_cycle(cfg, model, device, log_path, inference_rtg):
     client = BinanceFuturesClient(cfg["papertrade"]["base_url"], api_key, api_secret)
 
     seq_len = cfg["dataset"]["seq_len"]
+    ema_windows = [int(w) for w in cfg["features"].get("ema_windows", [])]
+    ema_max = max(ema_windows) if ema_windows else 0
+    boll_window = int(cfg["features"].get("boll_window", 0))
+    macd_fast = int(cfg["features"].get("macd_fast", 0))
+    macd_slow = int(cfg["features"].get("macd_slow", 0))
+    macd_signal = int(cfg["features"].get("macd_signal", 0))
     max_window = max(
         cfg["features"]["volatility_window"],
-        cfg["features"]["ma_window"],
         cfg["features"]["rsi_window"],
         cfg["features"]["volume_z_window"],
         cfg["features"]["zscore_window"],
+        ema_max,
+        boll_window,
+        macd_fast,
+        macd_slow,
+        macd_signal,
     )
     # Extra history is needed because some features apply a rolling window and then a rolling z-score.
     lookback = seq_len + max_window + cfg["features"]["zscore_window"] + 5
 
     df = client.get_klines(cfg["papertrade"]["symbol"], cfg["papertrade"]["interval"], lookback)
     feat_df, state_cols = build_features(df, cfg["features"])
-    feat_df = feat_df.dropna(subset=state_cols + ["ma"]).reset_index(drop=True)
+    ema_window = int(cfg["behavior_policies"].get("ema_window", 18))
+    ema_col = f"ema_{ema_window}"
+    feat_df = feat_df.dropna(subset=state_cols + [ema_col]).reset_index(drop=True)
 
     if len(feat_df) < seq_len:
         append_log(
