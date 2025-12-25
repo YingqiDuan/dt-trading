@@ -541,9 +541,13 @@ def main():
 
         log_rows.append(log_row)
 
+        val_str = ""
+        if val_metrics is not None:
+            val_str = f" val_total_return={val_metrics['total_return']:.4f}"
         print(
             f"epoch {epoch}: policy_loss={policy_loss:.4f} value_loss={value_loss:.4f} "
-            f"entropy={entropy:.4f} mean_ep_return={mean_ep_return:.4f}"
+            f"entropy={entropy:.4f} approx_kl={approx_kl:.4f} clip_frac={clip_frac:.3f} "
+            f"mean_ep_return={mean_ep_return:.4f}{val_str}"
         )
 
     log_path = os.path.join(cfg["train"]["log_dir"], f"training_log_{run_id}.json")
