@@ -1,0 +1,89 @@
+data:
+  exchange: binance  # ccxt exchange id (e.g., binance)
+  symbol: BTC/USDT
+  timeframe: 15m  # 1m|3m|5m|15m|30m|1h|2h|4h|6h|8h|12h|1d|3d|1w|1M
+  since: "2023-01-01"
+  until: "2023-05-31"
+  train_end: "2023-03-31"
+  val_end: "2023-04-30"  # optional; if omitted, defaults to train_end
+  test_end: "2023-05-31"
+  limit: 1000
+  raw_dir: data/raw
+  feature_dir: data/features
+  dataset_dir: data/dataset
+
+features:
+  volatility_window: 24
+  ma_window: 24
+  rsi_window: 14
+  volume_z_window: 24
+  zscore_window: 24
+  include_rsi: true  # true|false
+  include_volume: true  # true|false
+  include_price_to_ma: true  # true|false
+  include_volatility: true  # true|false
+  include_log_return: true  # true|false
+
+behavior_policies:
+  ma_deadzone: 0.001
+  random_stay_prob: 0.5
+  mix_ratio: 0.5
+  seed: 42
+
+rewards:
+  fee: 0.0004
+  slip: 0.0002
+
+dataset:
+  seq_len: 64
+  rtg_scale: 1.0
+
+train:
+  batch_size: 64
+  epochs: 10
+  lr: 0.0003
+  weight_decay: 0.0001
+  d_model: 128
+  n_layers: 4
+  n_heads: 4
+  dropout: 0.1
+  grad_clip: 1.0
+  use_class_weights: true  # true|false
+  use_sampling: true  # true|false
+  sampling: "episode_return"  # uniform|rtg|episode_return
+  sampling_power: 1.0
+  sampling_epsilon: 0.001
+  device: auto  # auto|cpu|cuda
+  log_dir: outputs/train
+  checkpoint_dir: outputs/checkpoints
+
+backtest:
+  initial_cash: 10000
+  fee: 0.0004
+  slip: 0.0002
+  risk_free: 0.0
+  inference_rtg: "auto"  # "auto" | float
+  inference_rtg_quantile: 0.9
+  rtg_quantile_scope: "window_start"  # window_start|trajectory_start|all
+  output_dir: outputs/backtest
+
+papertrade:
+  base_url: "https://fapi.binance.com"  # https://fapi.binance.com | https://demo-fapi.binance.com
+  symbol: "BTCUSDT"
+  interval: "1h"  # 1m|3m|5m|15m|30m|1h|2h|4h|6h|8h|12h|1d|3d|1w|1M
+  trade_qty: 0.001
+  dry_run: true  # true|false
+  poll_seconds: 10
+  max_drawdown_pct: 0.3
+  log_path: outputs/papertrade/trade_log.csv
+  api_key_env: "BINANCE_API_KEY"
+  api_secret_env: "BINANCE_API_SECRET"
+
+walk_forward:
+  enabled: false  # true|false
+  train_bars: 4320
+  val_bars: 720
+  test_bars: 720
+  step_bars: 720
+  max_folds: 0  # 0 = all possible
+  output_dir: outputs/walk_forward

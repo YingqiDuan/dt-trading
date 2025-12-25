@@ -1,0 +1,7 @@
+ccxt
+numpy
+pandas
+pyyaml
+torch
+tqdm
+requests

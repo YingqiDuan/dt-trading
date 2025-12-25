@@ -1,0 +1,342 @@
+import argparse
+import hashlib
+import hmac
+import json
+import os
+import time
+from urllib.parse import urlencode
+
+import numpy as np
+import pandas as pd
+import requests
+import torch
+
+from dt_model import DecisionTransformer
+from features import build_features
+from utils import ensure_dir, load_config, resolve_inference_rtg, save_json
+
+
+def action_to_index(actions):
+    return actions + 1
+
+
+def index_to_action(index):
+    return index - 1
+
+
+def load_checkpoint(ckpt_path):
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    cfg = ckpt["model_config"]
+    model = DecisionTransformer(
+        state_dim=cfg["state_dim"],
+        act_dim=cfg["act_dim"],
+        seq_len=cfg["seq_len"],
+        d_model=cfg["d_model"],
+        n_layers=cfg["n_layers"],
+        n_heads=cfg["n_heads"],
+        dropout=cfg["dropout"],
+    )
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+    return model
+
+
+def interval_to_millis(interval):
+    unit = interval[-1]
+    amount = int(interval[:-1])
+    if unit == "m":
+        return amount * 60_000
+    if unit == "h":
+        return amount * 3_600_000
+    if unit == "d":
+        return amount * 86_400_000
+    raise ValueError(f"unsupported interval {interval}")
+
+
+class BinanceFuturesClient:
+    def __init__(self, base_url, api_key=None, api_secret=None):
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.api_secret = api_secret
+
+    def _headers(self):
+        headers = {}
+        if self.api_key:
+            headers["X-MBX-APIKEY"] = self.api_key
+        return headers
+
+    def _sign(self, params):
+        if not self.api_secret:
+            raise ValueError("api_secret required for signed endpoint")
+        query = urlencode(params)
+        signature = hmac.new(self.api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+        params["signature"] = signature
+        return params
+
+    def request(self, method, path, params=None, signed=False):
+        params = params or {}
+        if signed:
+            params["timestamp"] = int(time.time() * 1000)
+            params["recvWindow"] = 5000
+            params = self._sign(params)
+        url = f"{self.base_url}{path}"
+        resp = requests.request(method, url, params=params, headers=self._headers(), timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_klines(self, symbol, interval, limit):
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        data = self.request("GET", "/fapi/v1/klines", params=params)
+        rows = []
+        for row in data:
+            rows.append(
+                {
+                    "timestamp": int(row[0]),
+                    "open": float(row[1]),
+                    "high": float(row[2]),
+                    "low": float(row[3]),
+                    "close": float(row[4]),
+                    "volume": float(row[5]),
+                }
+            )
+        df = pd.DataFrame(rows)
+        df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        return df
+
+    def get_position_qty(self, symbol):
+        data = self.request("GET", "/fapi/v2/positionRisk", signed=True)
+        for row in data:
+            if row.get("symbol") == symbol:
+                return float(row.get("positionAmt", 0.0))
+        return 0.0
+
+    def place_order(self, symbol, side, qty):
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": "MARKET",
+            "quantity": qty,
+            "newOrderRespType": "RESULT",
+        }
+        return self.request("POST", "/fapi/v1/order", params=params, signed=True)
+
+
+def load_recent_logs(log_path, max_len):
+    if not os.path.exists(log_path):
+        return pd.DataFrame()
+    df = pd.read_csv(log_path)
+    if df.empty:
+        return df
+    return df.tail(max_len).reset_index(drop=True)
+
+
+def load_last_log(log_path):
+    if not os.path.exists(log_path):
+        return None
+    df = pd.read_csv(log_path)
+    if df.empty:
+        return None
+    return df.iloc[-1]
+
+
+def compute_equity(prev, close, target_pos, fee, slip, initial_cash):
+    if prev is None:
+        return initial_cash
+    prev_close = float(prev.get("close", close))
+    prev_pos = float(prev.get("target_position", prev.get("position", 0.0)))
+    prev_equity = float(prev.get("equity", initial_cash))
+    ret = (close / prev_close) - 1.0
+    trade_cost = (fee + slip) * abs(target_pos - prev_pos)
+    return prev_equity * (1.0 + prev_pos * ret - trade_cost)
+
+
+def append_log(path, row):
+    ensure_dir(os.path.dirname(path))
+    df = pd.DataFrame([row])
+    df.to_csv(path, mode="a", header=not os.path.exists(path), index=False)
+
+
+def run_cycle(cfg, model, device, log_path, inference_rtg):
+    api_key = os.getenv(cfg["papertrade"]["api_key_env"], "")
+    api_secret = os.getenv(cfg["papertrade"]["api_secret_env"], "")
+    client = BinanceFuturesClient(cfg["papertrade"]["base_url"], api_key, api_secret)
+
+    seq_len = cfg["dataset"]["seq_len"]
+    max_window = max(
+        cfg["features"]["volatility_window"],
+        cfg["features"]["ma_window"],
+        cfg["features"]["rsi_window"],
+        cfg["features"]["volume_z_window"],
+        cfg["features"]["zscore_window"],
+    )
+    # Extra history is needed because some features apply a rolling window and then a rolling z-score.
+    lookback = seq_len + max_window + cfg["features"]["zscore_window"] + 5
+
+    df = client.get_klines(cfg["papertrade"]["symbol"], cfg["papertrade"]["interval"], lookback)
+    feat_df, state_cols = build_features(df, cfg["features"])
+    feat_df = feat_df.dropna(subset=state_cols + ["ma"]).reset_index(drop=True)
+
+    if len(feat_df) < seq_len:
+        append_log(
+            log_path,
+            {
+                "timestamp": int(time.time() * 1000),
+                "status": "ERROR",
+                "error": "insufficient history for features",
+            },
+        )
+        return
+
+    last_row = feat_df.iloc[-1]
+    last_timestamp = int(last_row["timestamp"])
+    last_log = load_last_log(log_path)
+    if last_log is not None and int(last_log.get("timestamp", 0)) == last_timestamp:
+        return
+
+    state_window = feat_df[state_cols].tail(seq_len).to_numpy(dtype=np.float32)
+    recent_logs = load_recent_logs(log_path, seq_len + 1)
+    action_hist = (
+        recent_logs["action"].astype(int).tolist() if not recent_logs.empty and "action" in recent_logs else []
+    )
+    rtg_hist = (
+        recent_logs["rtg"].astype(float).tolist() if not recent_logs.empty and "rtg" in recent_logs else []
+    )
+
+    actions_in = np.zeros(seq_len, dtype=np.int64)
+    if action_hist:
+        hist = action_hist[-(seq_len - 1) :]
+        actions_in[-len(hist) :] = hist
+        if len(action_hist) >= seq_len:
+            actions_in[0] = int(action_hist[-seq_len])
+
+    current_rtg = inference_rtg
+    if last_log is not None:
+        prev_rtg = float(last_log.get("rtg", inference_rtg))
+        prev_close = float(last_log.get("close", last_row["close"]))
+        prev_action = int(last_log.get("action", 0))
+        prev_prev_action = 0
+        if len(action_hist) >= 2:
+            prev_prev_action = int(action_hist[-2])
+        ret = float(last_row["close"]) / prev_close - 1.0
+        trade_cost = (cfg["backtest"]["fee"] + cfg["backtest"]["slip"]) * abs(prev_action - prev_prev_action)
+        reward = prev_action * ret - trade_cost
+        current_rtg = prev_rtg - reward
+
+    rtg_window = np.full(seq_len, current_rtg, dtype=np.float32)
+    if rtg_hist:
+        hist = rtg_hist[-(seq_len - 1) :]
+        start = seq_len - 1 - len(hist)
+        rtg_window[start : seq_len - 1] = hist
+
+    with torch.no_grad():
+        s = torch.tensor(state_window, device=device).unsqueeze(0)
+        a = torch.tensor(action_to_index(actions_in), device=device).unsqueeze(0)
+        rtg = torch.tensor(rtg_window, device=device).unsqueeze(0)
+        logits = model(s, a, rtg)
+        action_idx = int(torch.argmax(logits[0, -1]).item())
+        action = int(index_to_action(action_idx))
+
+    features_hash = hashlib.sha256(state_window[-1].tobytes()).hexdigest()
+    dry_run = cfg["papertrade"]["dry_run"]
+    trade_qty = cfg["papertrade"]["trade_qty"]
+    target_qty = action * trade_qty
+
+    prev_log = last_log
+    equity = compute_equity(
+        prev_log,
+        float(last_row["close"]),
+        float(action),
+        cfg["backtest"]["fee"],
+        cfg["backtest"]["slip"],
+        cfg["backtest"]["initial_cash"],
+    )
+
+    peak_equity = equity
+    if os.path.exists(log_path):
+        log_df = pd.read_csv(log_path)
+        if not log_df.empty and "equity" in log_df.columns:
+            peak_equity = max(float(log_df["equity"].max()), equity)
+
+    max_dd = cfg["papertrade"]["max_drawdown_pct"]
+    halted = peak_equity > 0 and equity < peak_equity * (1.0 - max_dd)
+
+    current_qty = 0.0
+    order_resp = None
+    order_side = ""
+    error = ""
+
+    if dry_run:
+        if last_log is not None:
+            current_qty = float(last_log.get("position_qty", 0.0))
+    else:
+        try:
+            current_qty = client.get_position_qty(cfg["papertrade"]["symbol"])
+        except Exception as exc:
+            error = f"position_fetch_failed: {exc}"
+
+    if halted and not error:
+        error = "kill_switch_triggered"
+
+    delta = target_qty - current_qty
+    if not error:
+        if abs(delta) > 0:
+            order_side = "BUY" if delta > 0 else "SELL"
+            if dry_run:
+                current_qty = target_qty
+            else:
+                try:
+                    order_resp = client.place_order(cfg["papertrade"]["symbol"], order_side, abs(delta))
+                    current_qty = client.get_position_qty(cfg["papertrade"]["symbol"])
+                except Exception as exc:
+                    error = f"order_failed: {exc}"
+
+    status = "HALTED" if halted else ("ERROR" if error else "OK")
+    log_row = {
+        "timestamp": last_timestamp,
+        "close": float(last_row["close"]),
+        "action": action,
+        "target_position": action,
+        "position": action,
+        "rtg": float(current_rtg),
+        "position_qty": float(current_qty),
+        "order_side": order_side,
+        "equity": equity,
+        "features_hash": features_hash,
+        "logits": json.dumps(logits[0, -1].tolist()),
+        "status": status,
+        "error": error,
+        "dry_run": dry_run,
+    }
+
+    append_log(log_path, log_row)
+
+    if order_resp is not None:
+        resp_path = log_path.replace("trade_log.csv", "last_order.json")
+        save_json(resp_path, order_resp)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--ckpt", required=True)
+    parser.add_argument("--loop", action="store_true")
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = load_checkpoint(args.ckpt).to(device)
+    inference_rtg = resolve_inference_rtg(cfg)
+
+    log_path = cfg["papertrade"]["log_path"]
+    ensure_dir(os.path.dirname(log_path))
+
+    if args.loop:
+        while True:
+            run_cycle(cfg, model, device, log_path, inference_rtg)
+            time.sleep(cfg["papertrade"]["poll_seconds"])
+    else:
+        run_cycle(cfg, model, device, log_path, inference_rtg)
+
+
+if __name__ == "__main__":
+    main()
