@@ -13,7 +13,7 @@ import torch
 
 from dt_model import DecisionTransformer
 from features import build_features
-from utils import ensure_dir, load_config, resolve_inference_rtg, save_json
+from utils import ensure_dir, load_config, save_json
 
 
 def action_to_index(actions):
@@ -40,7 +40,6 @@ def load_checkpoint(ckpt_path):
     )
     model.load_state_dict(ckpt["model_state"], strict=False)
     model.eval()
-    model.condition_mode = cfg.get("condition_mode", "reward")
     return model
 
 
@@ -164,7 +163,6 @@ def run_cycle(cfg, model, device, log_path):
     api_secret = os.getenv(cfg["papertrade"]["api_secret_env"], "")
     client = BinanceFuturesClient(cfg["papertrade"]["base_url"], api_key, api_secret)
     action_mode = getattr(model, "action_mode", "discrete")
-    condition_mode = getattr(model, "condition_mode", "reward")
 
     seq_len = cfg["dataset"]["seq_len"]
     ema_windows = [int(w) for w in cfg["features"].get("ema_windows", [])]
@@ -189,9 +187,7 @@ def run_cycle(cfg, model, device, log_path):
 
     df = client.get_klines(cfg["papertrade"]["symbol"], cfg["papertrade"]["interval"], lookback)
     feat_df, state_cols = build_features(df, cfg["features"])
-    ema_window = int(cfg["behavior_policies"].get("ema_window", 18))
-    ema_col = f"ema_{ema_window}"
-    feat_df = feat_df.dropna(subset=state_cols + [ema_col]).reset_index(drop=True)
+    feat_df = feat_df.dropna(subset=state_cols).reset_index(drop=True)
 
     if len(feat_df) < seq_len:
         append_log(
@@ -224,11 +220,6 @@ def run_cycle(cfg, model, device, log_path):
         if not recent_logs.empty and "reward" in recent_logs
         else []
     )
-    rtg_hist = (
-        recent_logs["rtg"].astype(float).tolist()
-        if not recent_logs.empty and "rtg" in recent_logs
-        else []
-    )
 
     if action_mode == "continuous":
         actions_in = np.zeros((seq_len, 1), dtype=np.float32)
@@ -246,44 +237,22 @@ def run_cycle(cfg, model, device, log_path):
                 actions_in[0] = int(action_hist[-seq_len])
 
     current_reward = 0.0
-    current_rtg = None
-    if condition_mode == "rtg":
-        inference_rtg = resolve_inference_rtg(cfg)
-        current_rtg = inference_rtg
-        if last_log is not None:
-            prev_rtg = float(last_log.get("rtg", inference_rtg))
-            prev_close = float(last_log.get("close", last_row["close"]))
-            prev_action = float(last_log.get("action", 0.0))
-            prev_prev_action = float(action_hist[-2]) if len(action_hist) >= 2 else 0.0
-            ret = float(last_row["close"]) / prev_close - 1.0
-            trade_cost = (cfg["backtest"]["fee"] + cfg["backtest"]["slip"]) * abs(
-                prev_action - prev_prev_action
-            )
-            current_reward = prev_action * ret - trade_cost
-            current_rtg = prev_rtg - current_reward
+    if last_log is not None:
+        prev_close = float(last_log.get("close", last_row["close"]))
+        prev_action = float(last_log.get("action", 0.0))
+        prev_prev_action = float(action_hist[-2]) if len(action_hist) >= 2 else 0.0
+        ret = float(last_row["close"]) / prev_close - 1.0
+        trade_cost = (cfg["backtest"]["fee"] + cfg["backtest"]["slip"]) * abs(
+            prev_action - prev_prev_action
+        )
+        current_reward = prev_action * ret - trade_cost
 
-        reward_window = np.full(seq_len, current_rtg, dtype=np.float32)
-        if rtg_hist:
-            hist = rtg_hist[-(seq_len - 1) :]
-            start = seq_len - 1 - len(hist)
-            reward_window[start : seq_len - 1] = hist
-    else:
-        if last_log is not None:
-            prev_close = float(last_log.get("close", last_row["close"]))
-            prev_action = float(last_log.get("action", 0.0))
-            prev_prev_action = float(action_hist[-2]) if len(action_hist) >= 2 else 0.0
-            ret = float(last_row["close"]) / prev_close - 1.0
-            trade_cost = (cfg["backtest"]["fee"] + cfg["backtest"]["slip"]) * abs(
-                prev_action - prev_prev_action
-            )
-            current_reward = prev_action * ret - trade_cost
-
-        reward_window = np.zeros(seq_len, dtype=np.float32)
-        if reward_hist:
-            hist = reward_hist[-(seq_len - 1) :]
-            start = seq_len - 1 - len(hist)
-            reward_window[start : seq_len - 1] = hist
-        reward_window[-1] = current_reward
+    reward_window = np.zeros(seq_len, dtype=np.float32)
+    if reward_hist:
+        hist = reward_hist[-(seq_len - 1) :]
+        start = seq_len - 1 - len(hist)
+        reward_window[start : seq_len - 1] = hist
+    reward_window[-1] = current_reward
 
     with torch.no_grad():
         s = torch.tensor(state_window, device=device).unsqueeze(0)
@@ -368,10 +337,7 @@ def run_cycle(cfg, model, device, log_path):
         "error": error,
         "dry_run": dry_run,
     }
-    if condition_mode == "rtg":
-        log_row["rtg"] = float(current_rtg) if current_rtg is not None else 0.0
-    else:
-        log_row["reward"] = float(current_reward)
+    log_row["reward"] = float(current_reward)
 
     append_log(log_path, log_row)
 

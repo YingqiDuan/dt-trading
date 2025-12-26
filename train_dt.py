@@ -389,7 +389,8 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    set_seed(cfg["behavior_policies"].get("seed", 42))
+    seed = int(cfg.get("rl", {}).get("seed", 42))
+    set_seed(seed)
 
     raw_df = load_or_fetch(cfg)
     feat_df, state_cols = build_features(raw_df, cfg["features"])
@@ -444,7 +445,7 @@ def main():
         position_penalty=cfg["rl"].get("position_penalty", 0.0),
         drawdown_penalty=cfg["rl"].get("drawdown_penalty", 0.0),
         action_mode=action_mode,
-        rng=np.random.RandomState(cfg["behavior_policies"].get("seed", 42)),
+        rng=np.random.RandomState(seed),
     )
 
     ensure_dir(cfg["train"]["log_dir"])

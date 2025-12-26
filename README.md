@@ -49,11 +49,11 @@ python walk_forward.py --config config.yaml
 
 ## Project Structure
 
-- `dataset_builder.py`: fetch OHLCV, build features, generate trajectories (optional for caching)
+- `dataset_builder.py`: fetch OHLCV and build feature CSVs (optional for caching)
 - `train_dt.py`: train Decision Transformer policy with PPO on historical market env
 - `backtest.py`: vectorized backtest with friction + baselines
 - `papertrade.py`: Binance USDT-M futures paper trading loop
-- `walk_forward.py`: rolling train/val/test training + evaluation (BC or PPO via `walk_forward.mode`)
+- `walk_forward.py`: rolling train/val/test training + evaluation (PPO)
 - `dt_model.py`: transformer model
 - `market_env.py`: step-by-step historical market environment for RL rollouts
 - `features.py`: feature engineering
@@ -63,7 +63,6 @@ python walk_forward.py --config config.yaml
 
 - `data/raw/`: raw OHLCV
 - `data/features/`: feature CSV
-- `data/dataset/`: `.npz` trajectory datasets
 - `outputs/train/`: training logs
 - `outputs/checkpoints/`: model checkpoints
 - `outputs/backtest/`: metrics + equity curve
@@ -83,7 +82,6 @@ python walk_forward.py --config config.yaml
 - `rl.rollout_steps`, `rl.ppo_epochs`, `rl.minibatch_size`: PPO sampling + update schedule.
 - `rl.gamma`, `rl.gae_lambda`, `rl.clip_range`: PPO advantage/clip settings.
 - `papertrade.base_url`: `https://fapi.binance.com | https://demo-fapi.binance.com`.
-- `walk_forward.mode`: `bc | rl` to choose behavior-cloning or PPO for each fold.
 - `walk_forward.*`: rolling window sizes in bars; outputs to `outputs/walk_forward/`.
 
 ## Environment Variables

@@ -9,7 +9,7 @@ import torch
 from dataset_builder import load_or_fetch
 from dt_model import DecisionTransformer
 from features import build_features
-from utils import ensure_dir, load_config, parse_date, resolve_inference_rtg, save_json
+from utils import ensure_dir, load_config, parse_date, save_json
 
 
 def action_to_index(actions):
@@ -89,13 +89,11 @@ def action_distribution(actions):
     }
 
 
-def run_model_backtest(cfg, model, df, state_cols, device, inference_rtg_override=None):
+def run_model_backtest(cfg, model, df, state_cols, device):
     seq_len = cfg["dataset"]["seq_len"]
     fee = cfg["backtest"]["fee"]
     slip = cfg["backtest"]["slip"]
     action_mode = getattr(model, "action_mode", "discrete")
-    condition_mode = getattr(model, "condition_mode", "reward")
-    inference_rtg = None
 
     states = df[state_cols].to_numpy(dtype=np.float32)
     close = df["close"].to_numpy(dtype=np.float32)
@@ -106,15 +104,6 @@ def run_model_backtest(cfg, model, df, state_cols, device, inference_rtg_overrid
     else:
         actions = np.zeros(len(df), dtype=np.int64)
     rewards_hist = np.zeros(len(df), dtype=np.float32)
-    rtg_hist = None
-    if condition_mode == "rtg":
-        inference_rtg = (
-            float(inference_rtg_override)
-            if inference_rtg_override is not None
-            else resolve_inference_rtg(cfg)
-        )
-        rtg_hist = np.zeros(len(df), dtype=np.float32)
-        rtg_hist[0] = inference_rtg
     step_rewards = np.zeros(len(df), dtype=np.float32)
     prev_action = 0.0
     for idx in range(len(df)):
@@ -124,16 +113,10 @@ def run_model_backtest(cfg, model, df, state_cols, device, inference_rtg_overrid
             state_window = states[idx - seq_len + 1 : idx + 1]
             actions_window = actions[idx - seq_len + 1 : idx + 1]
             reward_window = rewards_hist[idx - seq_len + 1 : idx + 1]
-            rtg_window = None
-            if condition_mode == "rtg":
-                rtg_window = rtg_hist[idx - seq_len + 1 : idx + 1]
 
             with torch.no_grad():
                 s = torch.tensor(state_window, device=device).unsqueeze(0)
-                if condition_mode == "rtg":
-                    r = torch.tensor(rtg_window, device=device).unsqueeze(0)
-                else:
-                    r = torch.tensor(reward_window, device=device).unsqueeze(0)
+                r = torch.tensor(reward_window, device=device).unsqueeze(0)
                 if action_mode == "continuous":
                     actions_in = np.zeros((seq_len, 1), dtype=np.float32)
                     window_prev_action = actions[idx - seq_len] if idx - seq_len >= 0 else 0.0
@@ -158,10 +141,7 @@ def run_model_backtest(cfg, model, df, state_cols, device, inference_rtg_overrid
             ret = close[idx + 1] / close[idx] - 1.0
             trade_cost = (fee + slip) * abs(action - prev_action)
             reward = action * ret - trade_cost
-            if condition_mode == "rtg":
-                rtg_hist[idx + 1] = rtg_hist[idx] - reward
-            else:
-                rewards_hist[idx + 1] = reward
+            rewards_hist[idx + 1] = reward
             step_rewards[idx] = reward
         prev_action = action
 
@@ -183,10 +163,7 @@ def run_model_backtest(cfg, model, df, state_cols, device, inference_rtg_overrid
             "step_return": step_returns,
         }
     )
-    if condition_mode == "rtg":
-        curve["rtg"] = rtg_hist
-
-    return curve, equity, step_returns, trade_count, turnover, inference_rtg
+    return curve, equity, step_returns, trade_count, turnover
 
 
 def main():
@@ -197,10 +174,8 @@ def main():
 
     cfg = load_config(args.config)
     raw_df = load_or_fetch(cfg)
-    ema_window = int(cfg["behavior_policies"].get("ema_window", 18))
-    ema_col = f"ema_{ema_window}"
     feat_df, state_cols = build_features(raw_df, cfg["features"])
-    feat_df = feat_df.dropna(subset=state_cols + [ema_col]).reset_index(drop=True)
+    feat_df = feat_df.dropna(subset=state_cols).reset_index(drop=True)
 
     train_end = parse_date(cfg["data"]["train_end"])
     val_end = parse_date(cfg["data"].get("val_end", cfg["data"]["train_end"]))
@@ -228,9 +203,7 @@ def main():
     ).to(device)
     model.load_state_dict(ckpt["model_state"], strict=False)
     model.eval()
-    model.condition_mode = model_cfg.get("condition_mode", "reward")
-
-    curve, equity, step_returns, trade_count, turnover, inference_rtg = run_model_backtest(
+    curve, equity, step_returns, trade_count, turnover = run_model_backtest(
         cfg, model, test_df, state_cols, device
     )
 
@@ -247,35 +220,36 @@ def main():
             curve["action"].to_numpy(dtype=np.int64)
         )
         print(f"decision_transformer action_distribution: {dt_metrics['action_distribution']}")
-    if model.condition_mode == "rtg" and inference_rtg is not None:
-        dt_metrics["inference_rtg"] = float(inference_rtg)
     metrics = {"decision_transformer": dt_metrics}
 
     close = test_df["close"].to_numpy(dtype=np.float32)
-    ema_actions = np.where(
-        test_df["close"] / test_df[ema_col] - 1.0 > cfg["behavior_policies"]["ma_deadzone"],
-        1,
-        np.where(
-            test_df["close"] / test_df[ema_col] - 1.0 < -cfg["behavior_policies"]["ma_deadzone"],
-            -1,
-            0,
-        ),
-    ).astype(np.int64)
-
     buy_hold = np.ones(len(test_df), dtype=np.int64)
-    rng = np.random.RandomState(cfg["behavior_policies"].get("seed", 42))
+    rng = np.random.RandomState(int(cfg["backtest"].get("baseline_seed", 42)))
     rand_actions = np.zeros(len(test_df), dtype=np.int64)
     for idx in range(1, len(test_df)):
-        if rng.rand() < cfg["behavior_policies"]["random_stay_prob"]:
+        if rng.rand() < cfg["backtest"].get("random_stay_prob", 0.5):
             rand_actions[idx] = rand_actions[idx - 1]
         else:
             rand_actions[idx] = rng.choice([-1, 0, 1])
 
-    for name, actions in [
-        ("buy_hold", buy_hold),
-        ("ema_trend", ema_actions),
-        ("random", rand_actions),
-    ]:
+    baselines = [("buy_hold", buy_hold), ("random", rand_actions)]
+    ema_windows = [int(w) for w in cfg["features"].get("ema_windows", [])]
+    ema_window = max(ema_windows) if ema_windows else None
+    ema_col = f"ema_{ema_window}" if ema_window else None
+    if ema_col and ema_col in test_df.columns:
+        deadzone = float(cfg["backtest"].get("ema_deadzone", 0.001))
+        ema_actions = np.where(
+            test_df["close"] / test_df[ema_col] - 1.0 > deadzone,
+            1,
+            np.where(
+                test_df["close"] / test_df[ema_col] - 1.0 < -deadzone,
+                -1,
+                0,
+            ),
+        ).astype(np.int64)
+        baselines.append(("ema_trend", ema_actions))
+
+    for name, actions in baselines:
         eq, ret, trades, turnover = simulate(
             actions,
             close,
