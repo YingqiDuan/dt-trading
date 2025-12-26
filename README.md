@@ -22,6 +22,12 @@ python dataset_builder.py --config config.yaml --force
 python train_dt.py --config config.yaml
 ```
 
+Warm-start from saved weights (optimizer resets):
+
+```bash
+python train_dt.py --config config.yaml --init_ckpt outputs/checkpoints/dt_best_*.pt
+```
+
 3) Backtest (uses best checkpoint by default)
 
 ```bash

@@ -385,6 +385,7 @@ def evaluate_policy(cfg, model, df, state_cols, device, action_mode, act_dim):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--init_ckpt", default=None)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -419,6 +420,11 @@ def main():
         action_mode=action_mode,
         use_value_head=True,
     ).to(device)
+
+    if args.init_ckpt:
+        ckpt = torch.load(args.init_ckpt, map_location=device)
+        model.load_state_dict(ckpt["model_state"], strict=False)
+        print(f"loaded init checkpoint weights from {args.init_ckpt}")
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
