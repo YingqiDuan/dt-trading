@@ -43,7 +43,7 @@ dataset:
 train:
   batch_size: 64
   epochs: 100
-  lr: 0.0003
+  lr: 0.0002
   weight_decay: 0.0001
   d_model: 128
   n_layers: 4
@@ -58,12 +58,12 @@ rl:
   seed: 42
   action_mode: discrete  # discrete|continuous
   action_dim: 1
-  rollout_steps: 2048
-  ppo_epochs: 4
-  minibatch_size: 256
+  rollout_steps: 8192
+  ppo_epochs: 3
+  minibatch_size: 512
   gamma: 0.99
   gae_lambda: 0.95
-  clip_range: 0.2
+  clip_range: 0.12
   value_coef: 0.5
   entropy_coef: 0.01
   episode_len: 512  # null = full window
@@ -72,6 +72,9 @@ rl:
   position_penalty: 0.0
   drawdown_penalty: 0.0
   eval_every: 1
+  eval_mode: sample  # deterministic|sample
+  eval_samples: 5
+  eval_seed: 42
 
 backtest:
   initial_cash: 10000

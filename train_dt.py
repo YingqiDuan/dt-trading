@@ -321,63 +321,112 @@ def evaluate_policy(cfg, model, df, state_cols, device, action_mode, act_dim):
     close = df["close"].to_numpy(dtype=np.float32)
     timestamps = df["timestamp"].to_numpy(dtype=np.int64)
 
-    if action_mode == "continuous":
-        actions = np.zeros(len(df), dtype=np.float32)
+    eval_cfg = cfg.get("rl", {})
+    eval_mode = str(eval_cfg.get("eval_mode", "deterministic")).lower()
+    if eval_mode not in ("deterministic", "sample"):
+        eval_mode = "deterministic"
+    eval_samples = int(eval_cfg.get("eval_samples", 1))
+    if eval_mode == "deterministic":
+        eval_samples = 1
     else:
-        actions = np.zeros(len(df), dtype=np.int64)
+        eval_samples = max(1, eval_samples)
+    eval_seed = eval_cfg.get("eval_seed", None)
+    try:
+        eval_seed = int(eval_seed) if eval_seed is not None else None
+    except (TypeError, ValueError):
+        eval_seed = None
 
-    rewards_hist = np.zeros(len(df), dtype=np.float32)
-    prev_action = 0.0
-
-    for idx in range(len(df)):
-        if idx < seq_len:
-            action = 0.0 if action_mode == "continuous" else 0
+    def run_once(rng):
+        if action_mode == "continuous":
+            actions = np.zeros(len(df), dtype=np.float32)
         else:
-            state_window = states[idx - seq_len + 1 : idx + 1]
-            reward_window = rewards_hist[idx - seq_len + 1 : idx + 1]
-            action_window = actions[idx - seq_len + 1 : idx + 1]
+            actions = np.zeros(len(df), dtype=np.int64)
 
-            if action_mode == "continuous":
-                actions_in = np.zeros((seq_len, act_dim), dtype=np.float32)
-                window_prev = actions[idx - seq_len] if idx - seq_len >= 0 else 0.0
-                actions_in[0, 0] = float(window_prev)
-                actions_in[1:, 0] = action_window[:-1]
-                a = torch.tensor(actions_in, device=device).unsqueeze(0)
+        rewards_hist = np.zeros(len(df), dtype=np.float32)
+        prev_action = 0.0
+
+        for idx in range(len(df)):
+            if idx < seq_len:
+                action = 0.0 if action_mode == "continuous" else 0
             else:
-                actions_in = np.zeros(seq_len, dtype=np.int64)
-                window_prev = actions[idx - seq_len] if idx - seq_len >= 0 else 0
-                actions_in[0] = int(window_prev)
-                actions_in[1:] = action_window[:-1]
-                a = torch.tensor(action_to_index(actions_in), device=device).unsqueeze(0)
+                state_window = states[idx - seq_len + 1 : idx + 1]
+                reward_window = rewards_hist[idx - seq_len + 1 : idx + 1]
+                action_window = actions[idx - seq_len + 1 : idx + 1]
 
-            with torch.no_grad():
-                s = torch.tensor(state_window, device=device).unsqueeze(0)
-                r = torch.tensor(reward_window, device=device).unsqueeze(0)
-                logits = model(s, a, r)
                 if action_mode == "continuous":
-                    mean = logits[0, -1]
-                    action = float(torch.tanh(mean).cpu().numpy().item())
+                    actions_in = np.zeros((seq_len, act_dim), dtype=np.float32)
+                    window_prev = actions[idx - seq_len] if idx - seq_len >= 0 else 0.0
+                    actions_in[0, 0] = float(window_prev)
+                    actions_in[1:, 0] = action_window[:-1]
+                    a = torch.tensor(actions_in, device=device).unsqueeze(0)
                 else:
-                    action_idx = int(torch.argmax(logits[0, -1]).item())
-                    action = int(index_to_action(action_idx))
+                    actions_in = np.zeros(seq_len, dtype=np.int64)
+                    window_prev = actions[idx - seq_len] if idx - seq_len >= 0 else 0
+                    actions_in[0] = int(window_prev)
+                    actions_in[1:] = action_window[:-1]
+                    a = torch.tensor(action_to_index(actions_in), device=device).unsqueeze(0)
 
-        actions[idx] = action
-        if idx < len(df) - 1:
-            ret = close[idx + 1] / close[idx] - 1.0
-            trade_cost = (fee + slip) * abs(action - prev_action)
-            reward = action * ret - trade_cost
-            rewards_hist[idx + 1] = reward
-        prev_action = action
+                with torch.no_grad():
+                    s = torch.tensor(state_window, device=device).unsqueeze(0)
+                    r = torch.tensor(reward_window, device=device).unsqueeze(0)
+                    logits = model(s, a, r)
+                    if action_mode == "continuous":
+                        mean = logits[0, -1].detach().cpu().numpy()
+                        if eval_mode == "sample":
+                            std = model.log_std.exp().detach().cpu().numpy()
+                            sample = mean + rng.normal(scale=std, size=mean.shape)
+                            action = float(np.tanh(sample).squeeze())
+                        else:
+                            action = float(torch.tanh(logits[0, -1]).cpu().numpy().item())
+                    else:
+                        if eval_mode == "sample":
+                            probs = torch.softmax(logits[0, -1], dim=-1).cpu().numpy()
+                            action_idx = int(rng.choice(len(probs), p=probs))
+                        else:
+                            action_idx = int(torch.argmax(logits[0, -1]).item())
+                        action = int(index_to_action(action_idx))
 
-    equity, step_returns, trade_count, turnover = simulate(
-        actions,
-        close,
-        cfg["backtest"]["fee"],
-        cfg["backtest"]["slip"],
-        cfg["backtest"]["initial_cash"],
-    )
-    annual_factor = 24 * 365
-    metrics = compute_metrics(equity, step_returns, trade_count, turnover, annual_factor)
+            actions[idx] = action
+            if idx < len(df) - 1:
+                ret = close[idx + 1] / close[idx] - 1.0
+                trade_cost = (fee + slip) * abs(action - prev_action)
+                reward = action * ret - trade_cost
+                rewards_hist[idx + 1] = reward
+            prev_action = action
+
+        equity, step_returns, trade_count, turnover = simulate(
+            actions,
+            close,
+            cfg["backtest"]["fee"],
+            cfg["backtest"]["slip"],
+            cfg["backtest"]["initial_cash"],
+        )
+        annual_factor = 24 * 365
+        return compute_metrics(equity, step_returns, trade_count, turnover, annual_factor)
+
+    metrics_list = []
+    for sample_idx in range(eval_samples):
+        if eval_seed is None:
+            rng = np.random
+        else:
+            rng = np.random.RandomState(eval_seed + sample_idx)
+        metrics_list.append(run_once(rng))
+
+    if len(metrics_list) == 1:
+        metrics = metrics_list[0]
+    else:
+        metric_keys = [
+            "total_return",
+            "sharpe",
+            "max_drawdown",
+            "profit_factor",
+            "trade_count",
+            "turnover",
+        ]
+        metrics = {k: float(np.mean([m[k] for m in metrics_list])) for k in metric_keys}
+        metrics["eval_samples"] = eval_samples
+        metrics["eval_mode"] = eval_mode
+
     metrics["timestamps"] = [int(timestamps[0]), int(timestamps[-1])]
     return metrics
 
