@@ -96,9 +96,11 @@ def build_features(df, cfg):
     if include_macd:
         feature_cols.extend(["macd_line", "macd_signal", "macd_hist"])
 
+    skip_zscore = set(cfg.get("skip_zscore", []))
+    skip_zscore.add("volume_z")
     state_cols = []
     for col in feature_cols:
-        if col == "volume_z":
+        if col in skip_zscore:
             state_cols.append(col)
             continue
         z = rolling_zscore(out[col], cfg["zscore_window"])

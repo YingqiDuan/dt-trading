@@ -15,14 +15,15 @@ features:
   volatility_window: 24
   ma_window: 24
   ema_windows: [3, 6, 9, 12, 15, 18]
-  boll_window: 20
-  boll_n_std: 2.0
+  boll_window: 12
+  boll_n_std: 4.0
   macd_fast: 12
-  macd_slow: 26
+  macd_slow: 24
   macd_signal: 9
   rsi_window: 14
   volume_z_window: 24
   zscore_window: 24
+  skip_zscore: [volume_z, boll_z]
   include_log_return: true  # true|false
   include_volatility: true  # true|false
   include_volume: true  # true|false

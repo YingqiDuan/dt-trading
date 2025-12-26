@@ -6,7 +6,7 @@ import ccxt
 import pandas as pd
 
 from features import build_features
-from utils import ensure_dir, load_config, to_ms
+from utils import ensure_dir, load_config, parse_date, to_ms
 
 
 def fetch_ohlcv(exchange_id, symbol, timeframe, since, until, limit):
