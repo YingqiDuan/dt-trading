@@ -7,6 +7,10 @@ import pandas as pd
 
 from features import build_features
 from utils import ensure_dir, load_config, parse_date, to_ms
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
 
 
 def fetch_ohlcv(exchange_id, symbol, timeframe, since, until, limit):
@@ -17,6 +21,18 @@ def fetch_ohlcv(exchange_id, symbol, timeframe, since, until, limit):
     since_ms = to_ms(parse_date(since))
     until_ms = to_ms(parse_date(until))
     all_rows = []
+    total = None
+    if timeframe_ms > 0:
+        total = max(0, (until_ms - since_ms) // timeframe_ms)
+    pbar = None
+    if tqdm is not None:
+        pbar = tqdm(
+            total=total,
+            desc=f"fetch {symbol} {timeframe}",
+            unit="bar",
+            dynamic_ncols=True,
+            leave=False,
+        )
 
     while since_ms < until_ms:
         batch = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since_ms, limit=limit)
@@ -24,10 +40,14 @@ def fetch_ohlcv(exchange_id, symbol, timeframe, since, until, limit):
             break
         all_rows.extend(batch)
         since_ms = batch[-1][0] + timeframe_ms
+        if pbar is not None:
+            pbar.update(len(batch))
         if len(batch) < limit:
             break
         if exchange.rateLimit:
             time.sleep(exchange.rateLimit / 1000.0)
+    if pbar is not None:
+        pbar.close()
 
     df = pd.DataFrame(
         all_rows,

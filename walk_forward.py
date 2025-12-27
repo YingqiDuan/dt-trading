@@ -3,6 +3,10 @@ import os
 
 import numpy as np
 import torch
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
 
 from backtest import action_distribution, compute_metrics, run_model_backtest
 from dataset_builder import load_or_fetch
@@ -72,7 +76,15 @@ def train_for_fold_rl(cfg, train_df, val_df, state_cols, fold_dir, fold_seed):
     best_val = -float("inf")
     best_path = os.path.join(fold_dir, "dt_best.pt")
 
-    for epoch in range(1, cfg["train"]["epochs"] + 1):
+    epochs = int(cfg["train"]["epochs"])
+    train_cfg = cfg.get("train", {})
+    rollout_progress = bool(train_cfg.get("rollout_progress", False))
+    update_progress = bool(train_cfg.get("update_progress", False))
+    eval_progress = bool(train_cfg.get("eval_progress", False))
+    epoch_iter = range(1, epochs + 1)
+    progress_position = 0
+
+    for epoch in epoch_iter:
         buffer = collect_rollout(
             train_env,
             model,
@@ -83,10 +95,21 @@ def train_for_fold_rl(cfg, train_df, val_df, state_cols, fold_dir, fold_seed):
             rollout_steps,
             gamma,
             gae_lambda,
+            progress=rollout_progress,
+            progress_desc=f"train {epoch}",
+            progress_position=progress_position,
         )
 
         policy_loss, value_loss, entropy, approx_kl, clip_frac = ppo_update(
-            model, optimizer, buffer, device, cfg, action_mode
+            model,
+            optimizer,
+            buffer,
+            device,
+            cfg,
+            action_mode,
+            progress=update_progress,
+            progress_desc=f"update {epoch}",
+            progress_position=progress_position,
         )
 
         mean_ep_return = float(np.mean(buffer["ep_returns"])) if buffer["ep_returns"] else 0.0
@@ -96,7 +119,16 @@ def train_for_fold_rl(cfg, train_df, val_df, state_cols, fold_dir, fold_seed):
         improved = False
         if has_val and epoch % eval_every == 0:
             val_metrics = evaluate_policy(
-                cfg, model, val_df, state_cols, device, action_mode, act_dim
+                cfg,
+                model,
+                val_df,
+                state_cols,
+                device,
+                action_mode,
+                act_dim,
+                progress=eval_progress,
+                progress_desc=f"eval {epoch}",
+                progress_position=progress_position,
             )
             if val_metrics and val_metrics["total_return"] > best_val:
                 best_val = val_metrics["total_return"]

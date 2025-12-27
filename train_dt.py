@@ -5,6 +5,10 @@ import time
 import numpy as np
 import torch
 from torch.distributions import Categorical, Normal
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
 
 from dataset_builder import load_or_fetch, split_by_time
 from dt_model import DecisionTransformer
@@ -125,7 +129,20 @@ def compute_gae(rewards, values, dones, last_value, gamma, gae_lambda):
     return advantages, returns
 
 
-def collect_rollout(env, model, device, seq_len, action_mode, act_dim, rollout_steps, gamma, gae_lambda):
+def collect_rollout(
+    env,
+    model,
+    device,
+    seq_len,
+    action_mode,
+    act_dim,
+    rollout_steps,
+    gamma,
+    gae_lambda,
+    progress=False,
+    progress_desc=None,
+    progress_position=0,
+):
     states_hist = [env.reset()]
     actions_hist = []
     rewards_hist = [0.0]
@@ -144,7 +161,17 @@ def collect_rollout(env, model, device, seq_len, action_mode, act_dim, rollout_s
     ep_return = 0.0
     ep_len = 0
 
-    for _ in range(rollout_steps):
+    step_iter = range(rollout_steps)
+    if progress and tqdm is not None:
+        step_iter = tqdm(
+            step_iter,
+            desc=progress_desc or "rollout",
+            unit="step",
+            dynamic_ncols=True,
+            leave=False,
+            position=progress_position,
+        )
+    for _ in step_iter:
         state_ctx, action_ctx, reward_ctx = build_context(
             states_hist, actions_hist, rewards_hist, seq_len, action_mode, act_dim
         )
@@ -210,7 +237,17 @@ def collect_rollout(env, model, device, seq_len, action_mode, act_dim, rollout_s
     }
 
 
-def ppo_update(model, optimizer, buffer, device, cfg, action_mode):
+def ppo_update(
+    model,
+    optimizer,
+    buffer,
+    device,
+    cfg,
+    action_mode,
+    progress=False,
+    progress_desc=None,
+    progress_position=0,
+):
     clip_range = float(cfg["rl"].get("clip_range", 0.2))
     value_coef = float(cfg["rl"].get("value_coef", 0.5))
     entropy_coef = float(cfg["rl"].get("entropy_coef", 0.01))
@@ -243,6 +280,20 @@ def ppo_update(model, optimizer, buffer, device, cfg, action_mode):
     total_batches = 0
 
     batch_size = states.shape[0]
+    total_steps = 0
+    update_pbar = None
+    if progress and tqdm is not None:
+        steps_per_epoch = int(np.ceil(batch_size / minibatch_size))
+        total_steps = ppo_epochs * steps_per_epoch
+        update_pbar = tqdm(
+            total=total_steps,
+            desc=progress_desc or "update",
+            unit="batch",
+            dynamic_ncols=True,
+            leave=False,
+            position=progress_position,
+        )
+
     for _ in range(ppo_epochs):
         perm = np.random.permutation(batch_size)
         for start in range(0, batch_size, minibatch_size):
@@ -296,6 +347,11 @@ def ppo_update(model, optimizer, buffer, device, cfg, action_mode):
             total_kl += float(approx_kl.item())
             total_clip += float(clip_frac.item())
             total_batches += 1
+            if update_pbar is not None:
+                update_pbar.update(1)
+
+    if update_pbar is not None:
+        update_pbar.close()
 
     if total_batches == 0:
         return 0.0, 0.0, 0.0, 0.0, 0.0
@@ -309,7 +365,18 @@ def ppo_update(model, optimizer, buffer, device, cfg, action_mode):
     )
 
 
-def evaluate_policy(cfg, model, df, state_cols, device, action_mode, act_dim):
+def evaluate_policy(
+    cfg,
+    model,
+    df,
+    state_cols,
+    device,
+    action_mode,
+    act_dim,
+    progress=False,
+    progress_desc=None,
+    progress_position=0,
+):
     if df is None or df.empty:
         return None
 
@@ -336,7 +403,7 @@ def evaluate_policy(cfg, model, df, state_cols, device, action_mode, act_dim):
     except (TypeError, ValueError):
         eval_seed = None
 
-    def run_once(rng):
+    def run_once(rng, pbar):
         if action_mode == "continuous":
             actions = np.zeros(len(df), dtype=np.float32)
         else:
@@ -393,6 +460,8 @@ def evaluate_policy(cfg, model, df, state_cols, device, action_mode, act_dim):
                 reward = action * ret - trade_cost
                 rewards_hist[idx + 1] = reward
             prev_action = action
+            if pbar is not None:
+                pbar.update(1)
 
         equity, step_returns, trade_count, turnover = simulate(
             actions,
@@ -404,13 +473,28 @@ def evaluate_policy(cfg, model, df, state_cols, device, action_mode, act_dim):
         annual_factor = 24 * 365
         return compute_metrics(equity, step_returns, trade_count, turnover, annual_factor)
 
+    total_steps = len(df) * eval_samples
+    pbar = None
+    if progress and tqdm is not None:
+        pbar = tqdm(
+            total=total_steps,
+            desc=progress_desc or "eval",
+            unit="step",
+            dynamic_ncols=True,
+            leave=False,
+            position=progress_position,
+        )
+
     metrics_list = []
     for sample_idx in range(eval_samples):
         if eval_seed is None:
             rng = np.random
         else:
             rng = np.random.RandomState(eval_seed + sample_idx)
-        metrics_list.append(run_once(rng))
+        metrics_list.append(run_once(rng, pbar))
+
+    if pbar is not None:
+        pbar.close()
 
     if len(metrics_list) == 1:
         metrics = metrics_list[0]
@@ -510,7 +594,15 @@ def main():
     eval_every = int(cfg["rl"].get("eval_every", 1))
     has_val = val_df is not None and not val_df.empty
 
-    for epoch in range(1, cfg["train"]["epochs"] + 1):
+    epochs = int(cfg["train"]["epochs"])
+    train_cfg = cfg.get("train", {})
+    rollout_progress = bool(train_cfg.get("rollout_progress", False))
+    update_progress = bool(train_cfg.get("update_progress", False))
+    eval_progress = bool(train_cfg.get("eval_progress", False))
+    epoch_iter = range(1, epochs + 1)
+    progress_position = 0
+
+    for epoch in epoch_iter:
         buffer = collect_rollout(
             train_env,
             model,
@@ -521,10 +613,21 @@ def main():
             rollout_steps,
             gamma,
             gae_lambda,
+            progress=rollout_progress,
+            progress_desc=f"train {epoch}",
+            progress_position=progress_position,
         )
 
         policy_loss, value_loss, entropy, approx_kl, clip_frac = ppo_update(
-            model, optimizer, buffer, device, cfg, action_mode
+            model,
+            optimizer,
+            buffer,
+            device,
+            cfg,
+            action_mode,
+            progress=update_progress,
+            progress_desc=f"update {epoch}",
+            progress_position=progress_position,
         )
 
         mean_ep_return = float(np.mean(buffer["ep_returns"])) if buffer["ep_returns"] else 0.0
@@ -532,7 +635,18 @@ def main():
 
         val_metrics = None
         if has_val and eval_every > 0 and epoch % eval_every == 0:
-            val_metrics = evaluate_policy(cfg, model, val_df, state_cols, device, action_mode, act_dim)
+            val_metrics = evaluate_policy(
+                cfg,
+                model,
+                val_df,
+                state_cols,
+                device,
+                action_mode,
+                act_dim,
+                progress=eval_progress,
+                progress_desc=f"eval {epoch}",
+                progress_position=progress_position,
+            )
             if val_metrics is not None and val_metrics["total_return"] > best_val:
                 best_val = val_metrics["total_return"]
                 ckpt = {
