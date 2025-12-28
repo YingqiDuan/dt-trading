@@ -28,6 +28,12 @@ Warm-start from saved weights (optimizer resets):
 python train_dt.py --config config.yaml --init_ckpt outputs/checkpoints/dt_best_*.pt
 ```
 
+PPO mode ( online RL):
+
+```bash
+python train_dt.py --config config.yaml --mode ppo
+```
+
 3) Backtest (uses best checkpoint by default)
 
 ```bash
@@ -82,6 +88,7 @@ python walk_forward.py --config config.yaml
 - `dataset.behavior_policy`: offline action source (`ema_trend|random|buy_hold|flat`).
 - `dataset.target_return`, `dataset.rtg_scale`, `dataset.rtg_gamma`: RTG conditioning controls at inference time.
 - `rewards.price_mode`, `rewards.range_penalty`: bar pricing and volatility penalty for reward calculation.
+- `train.mode` or `--mode`: `offline | ppo`.
 - `papertrade.base_url`: `https://fapi.binance.com | https://demo-fapi.binance.com`.
 - `walk_forward.*`: rolling window sizes in bars; outputs to `outputs/walk_forward/`.
 

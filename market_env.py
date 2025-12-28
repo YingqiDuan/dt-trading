@@ -1,5 +1,7 @@
 import numpy as np
 
+from dt_utils import compute_step_reward
+
 
 class MarketEnv:
     def __init__(
@@ -16,10 +18,24 @@ class MarketEnv:
         drawdown_penalty=0.0,
         action_mode="discrete",
         rng=None,
+        open_prices=None,
+        high_prices=None,
+        low_prices=None,
+        price_mode="close",
+        range_penalty=0.0,
     ):
         self.states = np.asarray(states, dtype=np.float32)
         self.close = np.asarray(close, dtype=np.float32)
         self.timestamps = np.asarray(timestamps, dtype=np.int64)
+        self.open_prices = (
+            np.asarray(open_prices, dtype=np.float32) if open_prices is not None else None
+        )
+        self.high_prices = (
+            np.asarray(high_prices, dtype=np.float32) if high_prices is not None else None
+        )
+        self.low_prices = (
+            np.asarray(low_prices, dtype=np.float32) if low_prices is not None else None
+        )
         self.fee = float(fee)
         self.slip = float(slip)
         self.episode_len = int(episode_len) if episode_len is not None else None
@@ -29,6 +45,8 @@ class MarketEnv:
         self.drawdown_penalty = float(drawdown_penalty)
         self.action_mode = action_mode
         self.rng = rng or np.random.RandomState(0)
+        self.price_mode = price_mode
+        self.range_penalty = float(range_penalty)
 
         if len(self.states) < 2:
             raise ValueError("market env requires at least 2 timesteps")
@@ -72,26 +90,30 @@ class MarketEnv:
         else:
             action = int(np.clip(action, -1, 1))
 
-        ret = self.close[self.idx + 1] / self.close[self.idx] - 1.0
-        delta = action - self.position
-        trade_cost = (self.fee + self.slip) * abs(delta)
-        pnl = action * ret
-        step_return = pnl - trade_cost
-        reward = step_return
-        if self.turnover_penalty:
-            reward -= self.turnover_penalty * abs(delta)
-        if self.position_penalty:
-            reward -= self.position_penalty * abs(action)
+        reward, _, self.equity, self.max_equity = compute_step_reward(
+            action,
+            self.position,
+            float(self.close[self.idx]),
+            float(self.close[self.idx + 1]),
+            self.fee,
+            self.slip,
+            reward_scale=self.reward_scale,
+            turnover_penalty=self.turnover_penalty,
+            position_penalty=self.position_penalty,
+            drawdown_penalty=self.drawdown_penalty,
+            equity=self.equity,
+            max_equity=self.max_equity,
+            price_mode=self.price_mode,
+            open_t=float(self.open_prices[self.idx]) if self.open_prices is not None else None,
+            high_t=float(self.high_prices[self.idx]) if self.high_prices is not None else None,
+            low_t=float(self.low_prices[self.idx]) if self.low_prices is not None else None,
+            open_t1=float(self.open_prices[self.idx + 1]) if self.open_prices is not None else None,
+            high_t1=float(self.high_prices[self.idx + 1]) if self.high_prices is not None else None,
+            low_t1=float(self.low_prices[self.idx + 1]) if self.low_prices is not None else None,
+            range_penalty=self.range_penalty,
+        )
 
         self.position = action
-        self.equity *= 1.0 + step_return
-        if self.equity > self.max_equity:
-            self.max_equity = self.equity
-        if self.drawdown_penalty:
-            drawdown = max(0.0, (self.max_equity - self.equity) / self.max_equity)
-            reward -= self.drawdown_penalty * drawdown
-
-        reward *= self.reward_scale
 
         self.idx += 1
         done = self.idx >= self.end_idx

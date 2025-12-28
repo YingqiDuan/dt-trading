@@ -50,6 +50,7 @@ dataset:
   target_return: 0.0
 
 train:
+  mode: offline  # offline|ppo
   batch_size: 64
   epochs: 100
   lr: 0.0003
@@ -79,7 +80,7 @@ rl:
   eval_mode: deterministic  # deterministic|sample
   eval_samples: 5
   eval_seed: 42
-  # Legacy PPO knobs (unused by offline DT)
+  # PPO knobs (unused by offline DT)
   rollout_steps: 8192
   ppo_epochs: 3
   minibatch_size: 256
