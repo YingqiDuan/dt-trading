@@ -4,18 +4,24 @@ import time
 
 import numpy as np
 import torch
-from torch.distributions import Categorical, Normal
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
 try:
     from tqdm import tqdm
 except Exception:
     tqdm = None
 
+from backtest import compute_metrics, simulate
 from dataset_builder import load_or_fetch, split_by_time
 from dt_model import DecisionTransformer
+from dt_utils import (
+    compute_rtg,
+    compute_step_reward,
+    compute_trajectory_rewards,
+    update_rtg,
+)
 from features import build_features
-from market_env import MarketEnv
 from utils import ensure_dir, load_config, parse_date, save_json, set_seed
-from backtest import compute_metrics, simulate
 
 
 def select_device(pref):
@@ -38,331 +44,227 @@ def atanh(x):
     return 0.5 * (torch.log1p(x) - torch.log1p(-x))
 
 
-def build_context(states_hist, actions_hist, rewards_hist, seq_len, action_mode, act_dim):
-    start = max(0, len(states_hist) - seq_len)
-    actual_len = len(states_hist) - start
+def build_behavior_actions(df, cfg, action_mode, rng):
+    dataset_cfg = cfg.get("dataset", {})
+    policy = str(dataset_cfg.get("behavior_policy", "ema_trend")).lower()
 
-    state_window = np.asarray(states_hist[start:], dtype=np.float32)
-    reward_window = np.asarray(rewards_hist[start:], dtype=np.float32)
+    if policy == "ema_trend":
+        ema_windows = [int(w) for w in cfg.get("features", {}).get("ema_windows", [])]
+        ema_window = max(ema_windows) if ema_windows else None
+        ema_col = f"ema_{ema_window}" if ema_window else None
+        if not ema_col or ema_col not in df.columns:
+            print("behavior_policy=ema_trend but ema feature is missing; using flat actions")
+            actions = np.zeros(len(df), dtype=np.float32)
+        else:
+            deadzone = float(cfg.get("backtest", {}).get("ema_deadzone", 0.001))
+            close = df["close"].to_numpy(dtype=np.float32)
+            ema = df[ema_col].to_numpy(dtype=np.float32)
+            signal = close / ema - 1.0
+            actions = np.where(
+                signal > deadzone,
+                1.0,
+                np.where(signal < -deadzone, -1.0, 0.0),
+            )
+    elif policy == "buy_hold":
+        actions = np.ones(len(df), dtype=np.float32)
+    elif policy == "flat":
+        actions = np.zeros(len(df), dtype=np.float32)
+    elif policy == "random":
+        if action_mode == "continuous":
+            actions = rng.uniform(-1.0, 1.0, size=len(df)).astype(np.float32)
+        else:
+            stay_prob = float(cfg.get("backtest", {}).get("random_stay_prob", 0.5))
+            actions = np.zeros(len(df), dtype=np.int64)
+            for idx in range(1, len(df)):
+                if rng.rand() < stay_prob:
+                    actions[idx] = actions[idx - 1]
+                else:
+                    actions[idx] = int(rng.choice([-1, 0, 1]))
+    else:
+        raise ValueError(f"unsupported behavior_policy {policy}")
 
     if action_mode == "continuous":
-        actions_in = np.zeros((actual_len, act_dim), dtype=np.float32)
-        if start > 0:
-            actions_in[0, 0] = float(actions_hist[start - 1])
-        if actual_len > 1:
-            actions_in[1:, 0] = np.asarray(
-                actions_hist[start : start + actual_len - 1], dtype=np.float32
-            )
-        action_ctx = np.zeros((seq_len, act_dim), dtype=np.float32)
+        if actions.dtype != np.float32:
+            actions = actions.astype(np.float32)
+        actions = np.clip(actions, -1.0, 1.0)
     else:
-        actions_in = np.zeros(actual_len, dtype=np.int64)
-        if start > 0:
-            actions_in[0] = int(actions_hist[start - 1])
-        if actual_len > 1:
-            actions_in[1:] = np.asarray(actions_hist[start : start + actual_len - 1], dtype=np.int64)
-        action_ctx = np.zeros(seq_len, dtype=np.int64)
+        actions = actions.astype(np.int64)
 
-    state_ctx = np.zeros((seq_len, state_window.shape[1]), dtype=np.float32)
-    reward_ctx = np.zeros(seq_len, dtype=np.float32)
-    state_ctx[-actual_len:] = state_window
-    reward_ctx[-actual_len:] = reward_window
-    action_ctx[-actual_len:] = actions_in
-
-    return state_ctx, action_ctx, reward_ctx
+    return actions
 
 
-def policy_step(model, state_ctx, action_ctx, reward_ctx, device, action_mode):
-    with torch.no_grad():
-        states = torch.tensor(state_ctx, device=device).unsqueeze(0)
-        rewards = torch.tensor(reward_ctx, device=device).unsqueeze(0)
-        if action_mode == "continuous":
-            actions_in = torch.tensor(action_ctx, device=device).unsqueeze(0)
-            mean, values = model(states, actions_in, rewards, return_values=True)
-            mean = mean[:, -1]
-            values = values[:, -1]
-            log_std = model.log_std.view(1, -1)
-            std = log_std.exp()
-            normal = Normal(mean, std)
-            z = normal.rsample()
-            action = torch.tanh(z)
-            log_prob = normal.log_prob(z) - torch.log(1.0 - action.pow(2) + 1e-6)
-            log_prob = log_prob.sum(-1)
-            return float(action.squeeze(0).item()), None, float(log_prob.item()), float(values.item())
+def build_trajectories(df, state_cols, cfg, action_mode, act_dim, rng):
+    seq_len = int(cfg["dataset"]["seq_len"])
+    dataset_cfg = cfg.get("dataset", {})
+    episode_len = dataset_cfg.get("episode_len", None)
+    if episode_len is None:
+        episode_len = cfg.get("rl", {}).get("episode_len", None)
+    if episode_len is None:
+        episode_len = len(df)
+    else:
+        episode_len = int(episode_len)
+    if episode_len <= 0:
+        episode_len = len(df)
 
-        actions_in = torch.tensor(action_to_index(action_ctx), device=device).unsqueeze(0)
-        logits, values = model(states, actions_in, rewards, return_values=True)
-        logits = logits[:, -1]
-        values = values[:, -1]
-        dist = Categorical(logits=logits)
-        action_idx = dist.sample()
-        log_prob = dist.log_prob(action_idx)
-        action_val = int(index_to_action(action_idx.item()))
-        return action_val, int(action_idx.item()), float(log_prob.item()), float(values.item())
+    gamma = float(dataset_cfg.get("rtg_gamma", cfg.get("rl", {}).get("gamma", 1.0)))
+    rtg_scale = float(dataset_cfg.get("rtg_scale", 1.0))
+    if rtg_scale <= 0:
+        rtg_scale = 1.0
+
+    reward_scale = float(cfg.get("rl", {}).get("reward_scale", 1.0))
+    turnover_penalty = float(cfg.get("rl", {}).get("turnover_penalty", 0.0))
+    position_penalty = float(cfg.get("rl", {}).get("position_penalty", 0.0))
+    drawdown_penalty = float(cfg.get("rl", {}).get("drawdown_penalty", 0.0))
+    fee = float(cfg["rewards"]["fee"])
+    slip = float(cfg["rewards"]["slip"])
+
+    if action_mode == "continuous" and act_dim != 1:
+        raise ValueError("continuous action_mode currently supports action_dim=1")
+
+    actions = build_behavior_actions(df, cfg, action_mode, rng)
+    states = df[state_cols].to_numpy(dtype=np.float32)
+    close = df["close"].to_numpy(dtype=np.float32)
+
+    trajectories = []
+    start = 0
+    total_len = len(df)
+    while start < total_len:
+        end = min(start + episode_len, total_len)
+        if end - start < seq_len:
+            break
+        actions_ep = actions[start:end]
+        close_ep = close[start:end]
+        rewards_ep = compute_trajectory_rewards(
+            actions_ep,
+            close_ep,
+            fee,
+            slip,
+            reward_scale=reward_scale,
+            turnover_penalty=turnover_penalty,
+            position_penalty=position_penalty,
+            drawdown_penalty=drawdown_penalty,
+        )
+        rtg_ep = compute_rtg(rewards_ep, gamma) / rtg_scale
+        trajectories.append(
+            {
+                "states": states[start:end],
+                "actions": actions_ep,
+                "rtg": rtg_ep,
+            }
+        )
+        start = end
+
+    return trajectories
 
 
-def predict_value(model, state_ctx, action_ctx, reward_ctx, device, action_mode):
-    with torch.no_grad():
-        states = torch.tensor(state_ctx, device=device).unsqueeze(0)
-        rewards = torch.tensor(reward_ctx, device=device).unsqueeze(0)
-        if action_mode == "continuous":
-            actions_in = torch.tensor(action_ctx, device=device).unsqueeze(0)
+class TrajectoryDataset(Dataset):
+    def __init__(self, trajectories, seq_len, action_mode, act_dim):
+        self.trajectories = trajectories
+        self.seq_len = seq_len
+        self.action_mode = action_mode
+        self.act_dim = act_dim
+        self.window_counts = [
+            max(0, len(traj["states"]) - seq_len + 1) for traj in trajectories
+        ]
+        self.cum_windows = (
+            np.cumsum(self.window_counts) if self.window_counts else np.array([])
+        )
+
+    def __len__(self):
+        return int(self.cum_windows[-1]) if len(self.cum_windows) else 0
+
+    def __getitem__(self, idx):
+        if idx < 0 or idx >= len(self):
+            raise IndexError("trajectory index out of range")
+        traj_idx = int(np.searchsorted(self.cum_windows, idx, side="right"))
+        prev_cum = int(self.cum_windows[traj_idx - 1]) if traj_idx > 0 else 0
+        start = int(idx - prev_cum)
+        traj = self.trajectories[traj_idx]
+
+        states = traj["states"][start : start + self.seq_len]
+        actions = traj["actions"][start : start + self.seq_len]
+        rtg = traj["rtg"][start : start + self.seq_len]
+
+        if self.action_mode == "continuous":
+            actions_in = np.zeros((self.seq_len, self.act_dim), dtype=np.float32)
+            prev_action = traj["actions"][start - 1] if start > 0 else 0.0
+            actions_in[0, 0] = float(prev_action)
+            actions_in[1:, 0] = np.asarray(actions[:-1], dtype=np.float32)
+            targets = np.asarray(actions, dtype=np.float32)
         else:
-            actions_in = torch.tensor(action_to_index(action_ctx), device=device).unsqueeze(0)
-        _, values = model(states, actions_in, rewards, return_values=True)
-        return float(values[0, -1].item())
+            actions_in = np.zeros(self.seq_len, dtype=np.int64)
+            prev_action = traj["actions"][start - 1] if start > 0 else 0
+            actions_in[0] = int(prev_action)
+            actions_in[1:] = np.asarray(actions[:-1], dtype=np.int64)
+            targets = np.asarray(actions, dtype=np.int64)
+
+        return states, actions_in, rtg, targets
 
 
-def compute_gae(rewards, values, dones, last_value, gamma, gae_lambda):
-    advantages = np.zeros_like(rewards, dtype=np.float32)
-    last_adv = 0.0
-    for idx in reversed(range(len(rewards))):
-        if idx == len(rewards) - 1:
-            next_non_terminal = 1.0 - float(dones[idx])
-            next_value = last_value
-        else:
-            next_non_terminal = 1.0 - float(dones[idx])
-            next_value = values[idx + 1]
-        delta = rewards[idx] + gamma * next_value * next_non_terminal - values[idx]
-        last_adv = delta + gamma * gae_lambda * next_non_terminal * last_adv
-        advantages[idx] = last_adv
-    returns = advantages + values
-    return advantages, returns
-
-
-def collect_rollout(
-    env,
+def train_epoch(
     model,
+    loader,
+    optimizer,
     device,
-    seq_len,
     action_mode,
     act_dim,
-    rollout_steps,
-    gamma,
-    gae_lambda,
+    grad_clip=None,
     progress=False,
     progress_desc=None,
     progress_position=0,
 ):
-    states_hist = [env.reset()]
-    actions_hist = []
-    rewards_hist = [0.0]
-
-    ctx_states = []
-    ctx_actions = []
-    ctx_rewards = []
-    actions = []
-    log_probs = []
-    values = []
-    rewards = []
-    dones = []
-
-    ep_returns = []
-    ep_lengths = []
-    ep_return = 0.0
-    ep_len = 0
-
-    step_iter = range(rollout_steps)
-    if progress and tqdm is not None:
-        step_iter = tqdm(
-            step_iter,
-            desc=progress_desc or "rollout",
-            unit="step",
-            dynamic_ncols=True,
-            leave=False,
-            position=progress_position,
-        )
-    for _ in step_iter:
-        state_ctx, action_ctx, reward_ctx = build_context(
-            states_hist, actions_hist, rewards_hist, seq_len, action_mode, act_dim
-        )
-        action, action_idx, log_prob, value = policy_step(
-            model, state_ctx, action_ctx, reward_ctx, device, action_mode
-        )
-
-        next_state, reward, done, _ = env.step(action)
-
-        ctx_states.append(state_ctx)
-        ctx_actions.append(action_ctx)
-        ctx_rewards.append(reward_ctx)
-        actions.append(action_idx if action_mode == "discrete" else action)
-        log_probs.append(log_prob)
-        values.append(value)
-        rewards.append(reward)
-        dones.append(done)
-
-        actions_hist.append(action)
-        rewards_hist.append(reward)
-        states_hist.append(next_state)
-
-        ep_return += reward
-        ep_len += 1
-        if done:
-            ep_returns.append(ep_return)
-            ep_lengths.append(ep_len)
-            states_hist = [env.reset()]
-            actions_hist = []
-            rewards_hist = [0.0]
-            ep_return = 0.0
-            ep_len = 0
-
-    last_value = 0.0
-    if not dones[-1]:
-        state_ctx, action_ctx, reward_ctx = build_context(
-            states_hist, actions_hist, rewards_hist, seq_len, action_mode, act_dim
-        )
-        last_value = predict_value(model, state_ctx, action_ctx, reward_ctx, device, action_mode)
-
-    adv, ret = compute_gae(
-        np.asarray(rewards, dtype=np.float32),
-        np.asarray(values, dtype=np.float32),
-        np.asarray(dones, dtype=np.bool_),
-        last_value,
-        gamma,
-        gae_lambda,
-    )
-
-    return {
-        "states": np.asarray(ctx_states, dtype=np.float32),
-        "actions_in": np.asarray(ctx_actions),
-        "rewards_in": np.asarray(ctx_rewards, dtype=np.float32),
-        "actions": np.asarray(actions),
-        "log_probs": np.asarray(log_probs, dtype=np.float32),
-        "values": np.asarray(values, dtype=np.float32),
-        "rewards": np.asarray(rewards, dtype=np.float32),
-        "dones": np.asarray(dones, dtype=np.bool_),
-        "advantages": adv,
-        "returns": ret,
-        "ep_returns": ep_returns,
-        "ep_lengths": ep_lengths,
-    }
-
-
-def ppo_update(
-    model,
-    optimizer,
-    buffer,
-    device,
-    cfg,
-    action_mode,
-    progress=False,
-    progress_desc=None,
-    progress_position=0,
-):
-    clip_range = float(cfg["rl"].get("clip_range", 0.2))
-    value_coef = float(cfg["rl"].get("value_coef", 0.5))
-    entropy_coef = float(cfg["rl"].get("entropy_coef", 0.01))
-    ppo_epochs = int(cfg["rl"].get("ppo_epochs", 4))
-    minibatch_size = int(cfg["rl"].get("minibatch_size", 256))
-    grad_clip = cfg["train"].get("grad_clip", None)
-
-    states = torch.tensor(buffer["states"], device=device)
-    rewards_in = torch.tensor(buffer["rewards_in"], device=device)
-    actions_in = torch.tensor(buffer["actions_in"], device=device)
-    old_log_probs = torch.tensor(buffer["log_probs"], device=device)
-    advantages = torch.tensor(buffer["advantages"], device=device)
-    returns = torch.tensor(buffer["returns"], device=device)
-
-    if action_mode == "discrete":
-        actions = torch.tensor(buffer["actions"], device=device, dtype=torch.long)
-        actions_in = action_to_index(actions_in).long()
-    else:
-        actions = torch.tensor(buffer["actions"], device=device, dtype=torch.float32)
-        if actions.dim() == 1:
-            actions = actions.unsqueeze(-1)
-
-    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-    total_policy_loss = 0.0
-    total_value_loss = 0.0
-    total_entropy = 0.0
-    total_kl = 0.0
-    total_clip = 0.0
+    model.train()
+    total_loss = 0.0
     total_batches = 0
 
-    batch_size = states.shape[0]
-    total_steps = 0
-    update_pbar = None
+    train_iter = loader
+    pbar = None
     if progress and tqdm is not None:
-        steps_per_epoch = int(np.ceil(batch_size / minibatch_size))
-        total_steps = ppo_epochs * steps_per_epoch
-        update_pbar = tqdm(
-            total=total_steps,
-            desc=progress_desc or "update",
+        pbar = tqdm(
+            total=len(loader),
+            desc=progress_desc or "train",
             unit="batch",
             dynamic_ncols=True,
             leave=False,
             position=progress_position,
         )
 
-    for _ in range(ppo_epochs):
-        perm = np.random.permutation(batch_size)
-        for start in range(0, batch_size, minibatch_size):
-            idx = perm[start : start + minibatch_size]
-            logits, values = model(
-                states[idx],
-                actions_in[idx],
-                rewards_in[idx],
-                return_values=True,
-            )
-            logits = logits[:, -1]
-            values = values[:, -1]
+    for states, actions_in, rtg, targets in train_iter:
+        states = states.to(device)
+        rtg = rtg.to(device)
 
-            if action_mode == "continuous":
-                mean = logits
-                log_std = model.log_std.view(1, -1)
-                std = log_std.exp()
-                normal = Normal(mean, std)
-                clipped_actions = torch.clamp(actions[idx], -0.999, 0.999)
-                z = atanh(clipped_actions)
-                new_log_prob = normal.log_prob(z) - torch.log(1.0 - clipped_actions.pow(2) + 1e-6)
-                new_log_prob = new_log_prob.sum(-1)
-                entropy = normal.entropy().sum(-1)
-            else:
-                dist = Categorical(logits=logits)
-                new_log_prob = dist.log_prob(actions[idx])
-                entropy = dist.entropy()
+        if action_mode == "continuous":
+            actions_in = actions_in.to(device)
+            targets = targets.to(device)
+            logits = model(states, actions_in, rtg)
+            target_clipped = torch.clamp(targets, -0.999, 0.999)
+            target_pre = atanh(target_clipped)
+            if target_pre.dim() == 2:
+                target_pre = target_pre.unsqueeze(-1)
+            loss = F.mse_loss(logits, target_pre)
+        else:
+            actions_in = action_to_index(actions_in).long().to(device)
+            targets = action_to_index(targets).long().to(device)
+            logits = model(states, actions_in, rtg)
+            loss = F.cross_entropy(logits.reshape(-1, act_dim), targets.reshape(-1))
 
-            log_ratio = new_log_prob - old_log_probs[idx]
-            ratio = torch.exp(log_ratio)
-            surr1 = ratio * advantages[idx]
-            surr2 = torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range) * advantages[idx]
-            policy_loss = -torch.min(surr1, surr2).mean()
-            value_loss = 0.5 * (returns[idx] - values).pow(2).mean()
-            entropy_loss = -entropy_coef * entropy.mean()
-            loss = policy_loss + value_coef * value_loss + entropy_loss
+        optimizer.zero_grad()
+        loss.backward()
+        if grad_clip is not None and grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
 
-            optimizer.zero_grad()
-            loss.backward()
-            if grad_clip is not None and grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
+        total_loss += float(loss.item())
+        total_batches += 1
+        if pbar is not None:
+            pbar.update(1)
 
-            with torch.no_grad():
-                approx_kl = (old_log_probs[idx] - new_log_prob).mean()
-                clip_frac = (torch.abs(ratio - 1.0) > clip_range).float().mean()
-
-            total_policy_loss += float(policy_loss.item())
-            total_value_loss += float(value_loss.item())
-            total_entropy += float(entropy.mean().item())
-            total_kl += float(approx_kl.item())
-            total_clip += float(clip_frac.item())
-            total_batches += 1
-            if update_pbar is not None:
-                update_pbar.update(1)
-
-    if update_pbar is not None:
-        update_pbar.close()
+    if pbar is not None:
+        pbar.close()
 
     if total_batches == 0:
-        return 0.0, 0.0, 0.0, 0.0, 0.0
-
-    return (
-        total_policy_loss / total_batches,
-        total_value_loss / total_batches,
-        total_entropy / total_batches,
-        total_kl / total_batches,
-        total_clip / total_batches,
-    )
+        return 0.0
+    return total_loss / total_batches
 
 
 def evaluate_policy(
@@ -380,9 +282,23 @@ def evaluate_policy(
     if df is None or df.empty:
         return None
 
+    was_training = model.training
+    model.eval()
+
     seq_len = cfg["dataset"]["seq_len"]
-    fee = cfg["rewards"]["fee"]
-    slip = cfg["rewards"]["slip"]
+    fee = float(cfg["rewards"]["fee"])
+    slip = float(cfg["rewards"]["slip"])
+    reward_scale = float(cfg.get("rl", {}).get("reward_scale", 1.0))
+    turnover_penalty = float(cfg.get("rl", {}).get("turnover_penalty", 0.0))
+    position_penalty = float(cfg.get("rl", {}).get("position_penalty", 0.0))
+    drawdown_penalty = float(cfg.get("rl", {}).get("drawdown_penalty", 0.0))
+
+    dataset_cfg = cfg.get("dataset", {})
+    target_return = float(dataset_cfg.get("target_return", 0.0))
+    rtg_scale = float(dataset_cfg.get("rtg_scale", 1.0))
+    if rtg_scale <= 0:
+        rtg_scale = 1.0
+    gamma = float(dataset_cfg.get("rtg_gamma", cfg.get("rl", {}).get("gamma", 1.0)))
 
     states = df[state_cols].to_numpy(dtype=np.float32)
     close = df["close"].to_numpy(dtype=np.float32)
@@ -409,33 +325,36 @@ def evaluate_policy(
         else:
             actions = np.zeros(len(df), dtype=np.int64)
 
-        rewards_hist = np.zeros(len(df), dtype=np.float32)
+        rtg_hist = np.zeros(len(df), dtype=np.float32)
+        rtg_hist[0] = target_return
+        current_rtg = float(target_return)
         prev_action = 0.0
+        equity = 1.0
+        max_equity = 1.0
 
         for idx in range(len(df)):
             if idx < seq_len:
                 action = 0.0 if action_mode == "continuous" else 0
             else:
                 state_window = states[idx - seq_len + 1 : idx + 1]
-                reward_window = rewards_hist[idx - seq_len + 1 : idx + 1]
-                action_window = actions[idx - seq_len + 1 : idx + 1]
+                rtg_window = rtg_hist[idx - seq_len + 1 : idx + 1] / rtg_scale
 
                 if action_mode == "continuous":
                     actions_in = np.zeros((seq_len, act_dim), dtype=np.float32)
                     window_prev = actions[idx - seq_len] if idx - seq_len >= 0 else 0.0
                     actions_in[0, 0] = float(window_prev)
-                    actions_in[1:, 0] = action_window[:-1]
+                    actions_in[1:, 0] = actions[idx - seq_len + 1 : idx]
                     a = torch.tensor(actions_in, device=device).unsqueeze(0)
                 else:
                     actions_in = np.zeros(seq_len, dtype=np.int64)
                     window_prev = actions[idx - seq_len] if idx - seq_len >= 0 else 0
                     actions_in[0] = int(window_prev)
-                    actions_in[1:] = action_window[:-1]
+                    actions_in[1:] = actions[idx - seq_len + 1 : idx]
                     a = torch.tensor(action_to_index(actions_in), device=device).unsqueeze(0)
 
                 with torch.no_grad():
                     s = torch.tensor(state_window, device=device).unsqueeze(0)
-                    r = torch.tensor(reward_window, device=device).unsqueeze(0)
+                    r = torch.tensor(rtg_window, device=device).unsqueeze(0)
                     logits = model(s, a, r)
                     if action_mode == "continuous":
                         mean = logits[0, -1].detach().cpu().numpy()
@@ -455,15 +374,27 @@ def evaluate_policy(
 
             actions[idx] = action
             if idx < len(df) - 1:
-                ret = close[idx + 1] / close[idx] - 1.0
-                trade_cost = (fee + slip) * abs(action - prev_action)
-                reward = action * ret - trade_cost
-                rewards_hist[idx + 1] = reward
+                reward, _, equity, max_equity = compute_step_reward(
+                    float(action),
+                    float(prev_action),
+                    float(close[idx]),
+                    float(close[idx + 1]),
+                    fee,
+                    slip,
+                    reward_scale=reward_scale,
+                    turnover_penalty=turnover_penalty,
+                    position_penalty=position_penalty,
+                    drawdown_penalty=drawdown_penalty,
+                    equity=equity,
+                    max_equity=max_equity,
+                )
+                current_rtg = update_rtg(current_rtg, reward, gamma)
+                rtg_hist[idx + 1] = current_rtg
             prev_action = action
             if pbar is not None:
                 pbar.update(1)
 
-        equity, step_returns, trade_count, turnover = simulate(
+        equity_curve, step_returns, trade_count, turnover = simulate(
             actions,
             close,
             cfg["backtest"]["fee"],
@@ -471,7 +402,7 @@ def evaluate_policy(
             cfg["backtest"]["initial_cash"],
         )
         annual_factor = 24 * 365
-        return compute_metrics(equity, step_returns, trade_count, turnover, annual_factor)
+        return compute_metrics(equity_curve, step_returns, trade_count, turnover, annual_factor)
 
     total_steps = len(df) * eval_samples
     pbar = None
@@ -512,6 +443,8 @@ def evaluate_policy(
         metrics["eval_mode"] = eval_mode
 
     metrics["timestamps"] = [int(timestamps[0]), int(timestamps[-1])]
+    if was_training:
+        model.train()
     return metrics
 
 
@@ -538,8 +471,8 @@ def main():
         raise ValueError("train split too small")
 
     device = select_device(cfg["train"]["device"])
-    action_mode = str(cfg["rl"].get("action_mode", "discrete")).lower()
-    act_dim = int(cfg["rl"].get("action_dim", 1)) if action_mode == "continuous" else 3
+    action_mode = str(cfg.get("rl", {}).get("action_mode", "discrete")).lower()
+    act_dim = int(cfg.get("rl", {}).get("action_dim", 1)) if action_mode == "continuous" else 3
     if action_mode == "continuous" and act_dim != 1:
         raise ValueError("continuous action_mode currently supports action_dim=1")
 
@@ -552,8 +485,9 @@ def main():
         n_heads=cfg["train"]["n_heads"],
         dropout=cfg["train"]["dropout"],
         action_mode=action_mode,
-        use_value_head=True,
+        use_value_head=False,
     ).to(device)
+    model.condition_mode = "rtg"
 
     if args.init_ckpt:
         ckpt = torch.load(args.init_ckpt, map_location=device)
@@ -566,72 +500,63 @@ def main():
         weight_decay=cfg["train"]["weight_decay"],
     )
 
-    train_env = MarketEnv(
-        states=train_df[state_cols].to_numpy(dtype=np.float32),
-        close=train_df["close"].to_numpy(dtype=np.float32),
-        timestamps=train_df["timestamp"].to_numpy(dtype=np.int64),
-        fee=cfg["rewards"]["fee"],
-        slip=cfg["rewards"]["slip"],
-        episode_len=cfg["rl"].get("episode_len", None),
-        reward_scale=cfg["rl"].get("reward_scale", 1.0),
-        turnover_penalty=cfg["rl"].get("turnover_penalty", 0.0),
-        position_penalty=cfg["rl"].get("position_penalty", 0.0),
-        drawdown_penalty=cfg["rl"].get("drawdown_penalty", 0.0),
-        action_mode=action_mode,
-        rng=np.random.RandomState(seed),
-    )
+    rng = np.random.RandomState(seed)
+    trajectories = build_trajectories(train_df, state_cols, cfg, action_mode, act_dim, rng)
+    dataset = TrajectoryDataset(trajectories, cfg["dataset"]["seq_len"], action_mode, act_dim)
+    if len(dataset) == 0:
+        raise ValueError("no training windows available; check seq_len/episode_len")
+
+    batch_size = int(cfg["train"]["batch_size"])
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False)
 
     ensure_dir(cfg["train"]["log_dir"])
     ensure_dir(cfg["train"]["checkpoint_dir"])
 
     log_rows = []
     best_val = -float("inf")
+    best_loss = float("inf")
     run_id = time.strftime("%Y%m%d_%H%M%S")
 
-    rollout_steps = int(cfg["rl"].get("rollout_steps", 2048))
-    gamma = float(cfg["rl"].get("gamma", 0.99))
-    gae_lambda = float(cfg["rl"].get("gae_lambda", 0.95))
-    eval_every = int(cfg["rl"].get("eval_every", 1))
+    eval_every = int(cfg.get("rl", {}).get("eval_every", 1))
     has_val = val_df is not None and not val_df.empty
 
     epochs = int(cfg["train"]["epochs"])
     train_cfg = cfg.get("train", {})
-    rollout_progress = bool(train_cfg.get("rollout_progress", False))
-    update_progress = bool(train_cfg.get("update_progress", False))
+    train_progress = bool(train_cfg.get("train_progress", train_cfg.get("update_progress", False)))
     eval_progress = bool(train_cfg.get("eval_progress", False))
     epoch_iter = range(1, epochs + 1)
     progress_position = 0
 
+    dataset_cfg = cfg.get("dataset", {})
+    ckpt_config = {
+        "state_dim": len(state_cols),
+        "act_dim": act_dim,
+        "seq_len": cfg["dataset"]["seq_len"],
+        "d_model": cfg["train"]["d_model"],
+        "n_layers": cfg["train"]["n_layers"],
+        "n_heads": cfg["train"]["n_heads"],
+        "dropout": cfg["train"]["dropout"],
+        "action_mode": action_mode,
+        "use_value_head": False,
+        "condition_mode": "rtg",
+        "rtg_gamma": float(dataset_cfg.get("rtg_gamma", cfg.get("rl", {}).get("gamma", 1.0))),
+        "rtg_scale": float(dataset_cfg.get("rtg_scale", 1.0)),
+        "target_return": float(dataset_cfg.get("target_return", 0.0)),
+    }
+
     for epoch in epoch_iter:
-        buffer = collect_rollout(
-            train_env,
+        train_loss = train_epoch(
             model,
+            loader,
+            optimizer,
             device,
-            cfg["dataset"]["seq_len"],
             action_mode,
             act_dim,
-            rollout_steps,
-            gamma,
-            gae_lambda,
-            progress=rollout_progress,
+            grad_clip=train_cfg.get("grad_clip", None),
+            progress=train_progress,
             progress_desc=f"train {epoch}",
             progress_position=progress_position,
         )
-
-        policy_loss, value_loss, entropy, approx_kl, clip_frac = ppo_update(
-            model,
-            optimizer,
-            buffer,
-            device,
-            cfg,
-            action_mode,
-            progress=update_progress,
-            progress_desc=f"update {epoch}",
-            progress_position=progress_position,
-        )
-
-        mean_ep_return = float(np.mean(buffer["ep_returns"])) if buffer["ep_returns"] else 0.0
-        mean_ep_len = float(np.mean(buffer["ep_lengths"])) if buffer["ep_lengths"] else 0.0
 
         val_metrics = None
         if has_val and eval_every > 0 and epoch % eval_every == 0:
@@ -649,57 +574,20 @@ def main():
             )
             if val_metrics is not None and val_metrics["total_return"] > best_val:
                 best_val = val_metrics["total_return"]
-                ckpt = {
-                    "model_state": model.state_dict(),
-                    "model_config": {
-                        "state_dim": len(state_cols),
-                        "act_dim": act_dim,
-                        "seq_len": cfg["dataset"]["seq_len"],
-                        "d_model": cfg["train"]["d_model"],
-                        "n_layers": cfg["train"]["n_layers"],
-                        "n_heads": cfg["train"]["n_heads"],
-                        "dropout": cfg["train"]["dropout"],
-                        "action_mode": action_mode,
-                        "use_value_head": True,
-                        "condition_mode": "reward",
-                    },
-                }
+                ckpt = {"model_state": model.state_dict(), "model_config": ckpt_config}
                 best_path = os.path.join(
                     cfg["train"]["checkpoint_dir"], f"dt_best_{run_id}.pt"
                 )
                 torch.save(ckpt, best_path)
-        elif not has_val and mean_ep_return > best_val:
-            best_val = mean_ep_return
-            ckpt = {
-                "model_state": model.state_dict(),
-                "model_config": {
-                    "state_dim": len(state_cols),
-                    "act_dim": act_dim,
-                    "seq_len": cfg["dataset"]["seq_len"],
-                    "d_model": cfg["train"]["d_model"],
-                    "n_layers": cfg["train"]["n_layers"],
-                    "n_heads": cfg["train"]["n_heads"],
-                    "dropout": cfg["train"]["dropout"],
-                    "action_mode": action_mode,
-                    "use_value_head": True,
-                    "condition_mode": "reward",
-                },
-            }
+        elif not has_val and train_loss < best_loss:
+            best_loss = train_loss
+            ckpt = {"model_state": model.state_dict(), "model_config": ckpt_config}
             best_path = os.path.join(
                 cfg["train"]["checkpoint_dir"], f"dt_best_{run_id}.pt"
             )
             torch.save(ckpt, best_path)
 
-        log_row = {
-            "epoch": epoch,
-            "policy_loss": policy_loss,
-            "value_loss": value_loss,
-            "entropy": entropy,
-            "approx_kl": approx_kl,
-            "clip_frac": clip_frac,
-            "mean_episode_return": mean_ep_return,
-            "mean_episode_len": mean_ep_len,
-        }
+        log_row = {"epoch": epoch, "train_loss": train_loss}
         if val_metrics is not None:
             log_row.update(
                 {
@@ -714,11 +602,7 @@ def main():
         val_str = ""
         if val_metrics is not None:
             val_str = f" val_total_return={val_metrics['total_return']:.4f}"
-        print(
-            f"epoch {epoch}: policy_loss={policy_loss:.4f} value_loss={value_loss:.4f} "
-            f"entropy={entropy:.4f} approx_kl={approx_kl:.4f} clip_frac={clip_frac:.3f} "
-            f"mean_ep_return={mean_ep_return:.4f}{val_str}"
-        )
+        print(f"epoch {epoch}: train_loss={train_loss:.6f}{val_str}")
 
     log_path = os.path.join(cfg["train"]["log_dir"], f"training_log_{run_id}.json")
     save_json(log_path, log_rows)

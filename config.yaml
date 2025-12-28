@@ -3,10 +3,10 @@ data:
   symbol: BTC/USDT
   timeframe: 15m  # 1m|3m|5m|15m|30m|1h|2h|4h|6h|8h|12h|1d|3d|1w|1M
   since: "2023-01-01"
-  until: "2023-05-31"
-  train_end: "2023-03-31"
-  val_end: "2023-04-30"  # optional; if omitted, defaults to train_end
-  test_end: "2023-05-31"
+  until: "2025-12-31"
+  train_end: "2024-12-31"
+  val_end: "2025-06-30"  # optional; if omitted, defaults to train_end
+  test_end: "2025-12-31"
   limit: 1000
   raw_dir: data/raw
   feature_dir: data/features
@@ -38,43 +38,51 @@ rewards:
   slip: 0.0002
 
 dataset:
-  seq_len: 64
+  seq_len: 128
+  episode_len: 512  # null = full window
+  behavior_policy: ema_trend  # ema_trend|random|buy_hold|flat
+  rtg_gamma: 1.0
+  rtg_scale: 1.0
+  target_return: 0.0
 
 train:
   batch_size: 64
   epochs: 100
-  lr: 0.0002
+  lr: 0.0003
   weight_decay: 0.0001
   d_model: 128
   n_layers: 4
   n_heads: 4
   dropout: 0.1
   grad_clip: 1.0
+  rollout_progress: true
+  update_progress: true
+  eval_progress: true
   device: auto  # auto|cpu|cuda
   log_dir: outputs/train
   checkpoint_dir: outputs/checkpoints
 
 rl:
   seed: 42
-  action_mode: discrete  # discrete|continuous
+  action_mode: continuous  # discrete|continuous
   action_dim: 1
-  rollout_steps: 8192
-  ppo_epochs: 3
-  minibatch_size: 512
-  gamma: 0.99
-  gae_lambda: 0.95
-  clip_range: 0.12
-  value_coef: 0.5
-  entropy_coef: 0.01
-  episode_len: 512  # null = full window
-  reward_scale: 1.0
+  gamma: 0.99  # fallback if dataset.rtg_gamma is not set
+  reward_scale: 100.0
   turnover_penalty: 0.0
   position_penalty: 0.0
   drawdown_penalty: 0.0
   eval_every: 1
-  eval_mode: sample  # deterministic|sample
+  eval_mode: deterministic  # deterministic|sample
   eval_samples: 5
   eval_seed: 42
+  # Legacy PPO knobs (unused by offline DT)
+  rollout_steps: 8192
+  ppo_epochs: 3
+  minibatch_size: 256
+  gae_lambda: 0.95
+  clip_range: 0.15
+  value_coef: 0.5
+  entropy_coef: 0.02
 
 backtest:
   initial_cash: 10000

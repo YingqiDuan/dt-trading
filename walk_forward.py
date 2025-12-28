@@ -3,6 +3,7 @@ import os
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 try:
     from tqdm import tqdm
 except Exception:
@@ -12,15 +13,20 @@ from backtest import action_distribution, compute_metrics, run_model_backtest
 from dataset_builder import load_or_fetch
 from dt_model import DecisionTransformer
 from features import build_features
-from market_env import MarketEnv
-from train_dt import collect_rollout, evaluate_policy, ppo_update, select_device
+from train_dt import (
+    TrajectoryDataset,
+    build_trajectories,
+    evaluate_policy,
+    select_device,
+    train_epoch,
+)
 from utils import ensure_dir, load_config, save_json, set_seed
 
 
-def train_for_fold_rl(cfg, train_df, val_df, state_cols, fold_dir, fold_seed):
+def train_for_fold_offline(cfg, train_df, val_df, state_cols, fold_dir, fold_seed):
     device = select_device(cfg["train"]["device"])
-    action_mode = str(cfg["rl"].get("action_mode", "discrete")).lower()
-    act_dim = int(cfg["rl"].get("action_dim", 1)) if action_mode == "continuous" else 3
+    action_mode = str(cfg.get("rl", {}).get("action_mode", "discrete")).lower()
+    act_dim = int(cfg.get("rl", {}).get("action_dim", 1)) if action_mode == "continuous" else 3
     if action_mode == "continuous" and act_dim != 1:
         raise ValueError("continuous action_mode currently supports action_dim=1")
 
@@ -33,9 +39,9 @@ def train_for_fold_rl(cfg, train_df, val_df, state_cols, fold_dir, fold_seed):
         n_heads=cfg["train"]["n_heads"],
         dropout=cfg["train"]["dropout"],
         action_mode=action_mode,
-        use_value_head=True,
+        use_value_head=False,
     ).to(device)
-    model.condition_mode = "reward"
+    model.condition_mode = "rtg"
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -43,77 +49,64 @@ def train_for_fold_rl(cfg, train_df, val_df, state_cols, fold_dir, fold_seed):
         weight_decay=cfg["train"]["weight_decay"],
     )
 
-    episode_len = cfg["rl"].get("episode_len", None)
-    if episode_len is not None:
-        episode_len = int(episode_len)
-        if episode_len >= len(train_df):
-            episode_len = len(train_df) - 1
-        if episode_len <= 0:
-            raise ValueError("episode_len too small for walk-forward fold")
+    rng = np.random.RandomState(fold_seed)
+    trajectories = build_trajectories(train_df, state_cols, cfg, action_mode, act_dim, rng)
+    dataset = TrajectoryDataset(trajectories, cfg["dataset"]["seq_len"], action_mode, act_dim)
+    if len(dataset) == 0:
+        raise ValueError("no training windows available; check seq_len/episode_len")
 
-    train_env = MarketEnv(
-        states=train_df[state_cols].to_numpy(dtype=np.float32),
-        close=train_df["close"].to_numpy(dtype=np.float32),
-        timestamps=train_df["timestamp"].to_numpy(dtype=np.int64),
-        fee=cfg["rewards"]["fee"],
-        slip=cfg["rewards"]["slip"],
-        episode_len=episode_len,
-        reward_scale=cfg["rl"].get("reward_scale", 1.0),
-        turnover_penalty=cfg["rl"].get("turnover_penalty", 0.0),
-        position_penalty=cfg["rl"].get("position_penalty", 0.0),
-        drawdown_penalty=cfg["rl"].get("drawdown_penalty", 0.0),
-        action_mode=action_mode,
-        rng=np.random.RandomState(fold_seed),
+    loader = DataLoader(
+        dataset,
+        batch_size=int(cfg["train"]["batch_size"]),
+        shuffle=True,
+        drop_last=False,
     )
 
-    rollout_steps = int(cfg["rl"].get("rollout_steps", 2048))
-    gamma = float(cfg["rl"].get("gamma", 0.99))
-    gae_lambda = float(cfg["rl"].get("gae_lambda", 0.95))
-    eval_every = int(cfg["rl"].get("eval_every", 1))
+    eval_every = int(cfg.get("rl", {}).get("eval_every", 1))
     has_val = eval_every > 0 and not val_df.empty
 
     log_rows = []
     best_val = -float("inf")
+    best_loss = float("inf")
     best_path = os.path.join(fold_dir, "dt_best.pt")
 
     epochs = int(cfg["train"]["epochs"])
     train_cfg = cfg.get("train", {})
-    rollout_progress = bool(train_cfg.get("rollout_progress", False))
-    update_progress = bool(train_cfg.get("update_progress", False))
+    train_progress = bool(train_cfg.get("train_progress", train_cfg.get("update_progress", False)))
     eval_progress = bool(train_cfg.get("eval_progress", False))
     epoch_iter = range(1, epochs + 1)
     progress_position = 0
 
+    dataset_cfg = cfg.get("dataset", {})
+    ckpt_config = {
+        "state_dim": len(state_cols),
+        "act_dim": act_dim,
+        "seq_len": cfg["dataset"]["seq_len"],
+        "d_model": cfg["train"]["d_model"],
+        "n_layers": cfg["train"]["n_layers"],
+        "n_heads": cfg["train"]["n_heads"],
+        "dropout": cfg["train"]["dropout"],
+        "action_mode": action_mode,
+        "use_value_head": False,
+        "condition_mode": "rtg",
+        "rtg_gamma": float(dataset_cfg.get("rtg_gamma", cfg.get("rl", {}).get("gamma", 1.0))),
+        "rtg_scale": float(dataset_cfg.get("rtg_scale", 1.0)),
+        "target_return": float(dataset_cfg.get("target_return", 0.0)),
+    }
+
     for epoch in epoch_iter:
-        buffer = collect_rollout(
-            train_env,
+        train_loss = train_epoch(
             model,
+            loader,
+            optimizer,
             device,
-            cfg["dataset"]["seq_len"],
             action_mode,
             act_dim,
-            rollout_steps,
-            gamma,
-            gae_lambda,
-            progress=rollout_progress,
+            grad_clip=train_cfg.get("grad_clip", None),
+            progress=train_progress,
             progress_desc=f"train {epoch}",
             progress_position=progress_position,
         )
-
-        policy_loss, value_loss, entropy, approx_kl, clip_frac = ppo_update(
-            model,
-            optimizer,
-            buffer,
-            device,
-            cfg,
-            action_mode,
-            progress=update_progress,
-            progress_desc=f"update {epoch}",
-            progress_position=progress_position,
-        )
-
-        mean_ep_return = float(np.mean(buffer["ep_returns"])) if buffer["ep_returns"] else 0.0
-        mean_ep_len = float(np.mean(buffer["ep_lengths"])) if buffer["ep_lengths"] else 0.0
 
         val_metrics = None
         improved = False
@@ -133,38 +126,15 @@ def train_for_fold_rl(cfg, train_df, val_df, state_cols, fold_dir, fold_seed):
             if val_metrics and val_metrics["total_return"] > best_val:
                 best_val = val_metrics["total_return"]
                 improved = True
-        elif not has_val and mean_ep_return > best_val:
-            best_val = mean_ep_return
+        elif not has_val and train_loss < best_loss:
+            best_loss = train_loss
             improved = True
 
         if improved:
-            ckpt = {
-                "model_state": model.state_dict(),
-                "model_config": {
-                    "state_dim": len(state_cols),
-                    "act_dim": act_dim,
-                    "seq_len": cfg["dataset"]["seq_len"],
-                    "d_model": cfg["train"]["d_model"],
-                    "n_layers": cfg["train"]["n_layers"],
-                    "n_heads": cfg["train"]["n_heads"],
-                    "dropout": cfg["train"]["dropout"],
-                    "action_mode": action_mode,
-                    "use_value_head": True,
-                    "condition_mode": "reward",
-                },
-            }
+            ckpt = {"model_state": model.state_dict(), "model_config": ckpt_config}
             torch.save(ckpt, best_path)
 
-        log_row = {
-            "epoch": epoch,
-            "policy_loss": policy_loss,
-            "value_loss": value_loss,
-            "entropy": entropy,
-            "approx_kl": approx_kl,
-            "clip_frac": clip_frac,
-            "mean_episode_return": mean_ep_return,
-            "mean_episode_len": mean_ep_len,
-        }
+        log_row = {"epoch": epoch, "train_loss": train_loss}
         if val_metrics is not None:
             log_row.update(
                 {
@@ -179,11 +149,7 @@ def train_for_fold_rl(cfg, train_df, val_df, state_cols, fold_dir, fold_seed):
         val_str = ""
         if val_metrics is not None:
             val_str = f" val_total_return={val_metrics['total_return']:.4f}"
-        print(
-            f"epoch {epoch}: policy_loss={policy_loss:.4f} value_loss={value_loss:.4f} "
-            f"entropy={entropy:.4f} approx_kl={approx_kl:.4f} clip_frac={clip_frac:.3f} "
-            f"mean_ep_return={mean_ep_return:.4f}{val_str}"
-        )
+        print(f"epoch {epoch}: train_loss={train_loss:.6f}{val_str}")
 
     log_path = os.path.join(fold_dir, "training_log.json")
     save_json(log_path, log_rows)
@@ -192,7 +158,7 @@ def train_for_fold_rl(cfg, train_df, val_df, state_cols, fold_dir, fold_seed):
         ckpt = torch.load(best_path, map_location=device)
         model.load_state_dict(ckpt["model_state"], strict=False)
     model.eval()
-    model.condition_mode = "reward"
+    model.condition_mode = "rtg"
     return model, best_path, log_rows
 
 
@@ -230,7 +196,7 @@ def main():
     total_len = len(feat_df)
     start_idx = 0
     fold_idx = 0
-    summary = {"folds": [], "mode": "rl"}
+    summary = {"folds": [], "mode": "dt"}
 
     while True:
         train_end = start_idx + train_bars
@@ -250,12 +216,12 @@ def main():
 
         print(f"fold {fold_idx}: train={len(train_df)} val={len(val_df)} test={len(test_df)}")
         fold_seed = seed + fold_idx
-        model, ckpt_path, _ = train_for_fold_rl(
+        model, ckpt_path, _ = train_for_fold_offline(
             cfg, train_df, val_df, state_cols, fold_dir, fold_seed
         )
 
         device = next(model.parameters()).device
-        curve, equity, step_returns, trade_count, turnover, _ = run_model_backtest(
+        curve, equity, step_returns, trade_count, turnover = run_model_backtest(
             cfg, model, test_df, state_cols, device
         )
 

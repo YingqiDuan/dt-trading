@@ -8,6 +8,7 @@ import torch
 
 from dataset_builder import load_or_fetch
 from dt_model import DecisionTransformer
+from dt_utils import compute_step_reward, update_rtg
 from features import build_features
 from utils import ensure_dir, load_config, parse_date, save_json
 
@@ -91,9 +92,20 @@ def action_distribution(actions):
 
 def run_model_backtest(cfg, model, df, state_cols, device):
     seq_len = cfg["dataset"]["seq_len"]
-    fee = cfg["backtest"]["fee"]
-    slip = cfg["backtest"]["slip"]
+    fee = cfg["rewards"]["fee"]
+    slip = cfg["rewards"]["slip"]
     action_mode = getattr(model, "action_mode", "discrete")
+    reward_scale = float(cfg.get("rl", {}).get("reward_scale", 1.0))
+    turnover_penalty = float(cfg.get("rl", {}).get("turnover_penalty", 0.0))
+    position_penalty = float(cfg.get("rl", {}).get("position_penalty", 0.0))
+    drawdown_penalty = float(cfg.get("rl", {}).get("drawdown_penalty", 0.0))
+
+    dataset_cfg = cfg.get("dataset", {})
+    target_return = float(dataset_cfg.get("target_return", 0.0))
+    rtg_scale = float(dataset_cfg.get("rtg_scale", 1.0))
+    if rtg_scale <= 0:
+        rtg_scale = 1.0
+    gamma = float(dataset_cfg.get("rtg_gamma", cfg.get("rl", {}).get("gamma", 1.0)))
 
     states = df[state_cols].to_numpy(dtype=np.float32)
     close = df["close"].to_numpy(dtype=np.float32)
@@ -103,20 +115,24 @@ def run_model_backtest(cfg, model, df, state_cols, device):
         actions = np.zeros(len(df), dtype=np.float32)
     else:
         actions = np.zeros(len(df), dtype=np.int64)
-    rewards_hist = np.zeros(len(df), dtype=np.float32)
+    rtg_hist = np.zeros(len(df), dtype=np.float32)
+    rtg_hist[0] = target_return
     step_rewards = np.zeros(len(df), dtype=np.float32)
     prev_action = 0.0
+    current_rtg = float(target_return)
+    equity = 1.0
+    max_equity = 1.0
     for idx in range(len(df)):
         if idx < seq_len:
             action = 0.0 if action_mode == "continuous" else 0
         else:
             state_window = states[idx - seq_len + 1 : idx + 1]
             actions_window = actions[idx - seq_len + 1 : idx + 1]
-            reward_window = rewards_hist[idx - seq_len + 1 : idx + 1]
+            rtg_window = rtg_hist[idx - seq_len + 1 : idx + 1] / rtg_scale
 
             with torch.no_grad():
                 s = torch.tensor(state_window, device=device).unsqueeze(0)
-                r = torch.tensor(reward_window, device=device).unsqueeze(0)
+                r = torch.tensor(rtg_window, device=device).unsqueeze(0)
                 if action_mode == "continuous":
                     actions_in = np.zeros((seq_len, 1), dtype=np.float32)
                     window_prev_action = actions[idx - seq_len] if idx - seq_len >= 0 else 0.0
@@ -138,10 +154,22 @@ def run_model_backtest(cfg, model, df, state_cols, device):
 
         actions[idx] = action
         if idx < len(df) - 1:
-            ret = close[idx + 1] / close[idx] - 1.0
-            trade_cost = (fee + slip) * abs(action - prev_action)
-            reward = action * ret - trade_cost
-            rewards_hist[idx + 1] = reward
+            reward, _, equity, max_equity = compute_step_reward(
+                float(action),
+                float(prev_action),
+                float(close[idx]),
+                float(close[idx + 1]),
+                fee,
+                slip,
+                reward_scale=reward_scale,
+                turnover_penalty=turnover_penalty,
+                position_penalty=position_penalty,
+                drawdown_penalty=drawdown_penalty,
+                equity=equity,
+                max_equity=max_equity,
+            )
+            current_rtg = update_rtg(current_rtg, reward, gamma)
+            rtg_hist[idx + 1] = current_rtg
             step_rewards[idx] = reward
         prev_action = action
 

@@ -12,6 +12,7 @@ import requests
 import torch
 
 from dt_model import DecisionTransformer
+from dt_utils import compute_step_reward, update_rtg
 from features import build_features
 from utils import ensure_dir, load_config, save_json
 
@@ -163,6 +164,19 @@ def run_cycle(cfg, model, device, log_path):
     api_secret = os.getenv(cfg["papertrade"]["api_secret_env"], "")
     client = BinanceFuturesClient(cfg["papertrade"]["base_url"], api_key, api_secret)
     action_mode = getattr(model, "action_mode", "discrete")
+    reward_fee = float(cfg["rewards"]["fee"])
+    reward_slip = float(cfg["rewards"]["slip"])
+    reward_scale = float(cfg.get("rl", {}).get("reward_scale", 1.0))
+    turnover_penalty = float(cfg.get("rl", {}).get("turnover_penalty", 0.0))
+    position_penalty = float(cfg.get("rl", {}).get("position_penalty", 0.0))
+    drawdown_penalty = float(cfg.get("rl", {}).get("drawdown_penalty", 0.0))
+
+    dataset_cfg = cfg.get("dataset", {})
+    target_return = float(dataset_cfg.get("target_return", 0.0))
+    rtg_scale = float(dataset_cfg.get("rtg_scale", 1.0))
+    if rtg_scale <= 0:
+        rtg_scale = 1.0
+    gamma = float(dataset_cfg.get("rtg_gamma", cfg.get("rl", {}).get("gamma", 1.0)))
 
     seq_len = cfg["dataset"]["seq_len"]
     ema_windows = [int(w) for w in cfg["features"].get("ema_windows", [])]
@@ -236,27 +250,51 @@ def run_cycle(cfg, model, device, log_path):
             if len(action_hist) >= seq_len:
                 actions_in[0] = int(action_hist[-seq_len])
 
+    prev_equity = float(last_log.get("equity", cfg["backtest"]["initial_cash"])) if last_log is not None else float(
+        cfg["backtest"]["initial_cash"]
+    )
+    max_equity = prev_equity
+    if os.path.exists(log_path):
+        log_df = pd.read_csv(log_path)
+        if not log_df.empty and "equity" in log_df.columns:
+            max_equity = max(max_equity, float(log_df["equity"].max()))
+
     current_reward = 0.0
     if last_log is not None:
         prev_close = float(last_log.get("close", last_row["close"]))
         prev_action = float(last_log.get("action", 0.0))
         prev_prev_action = float(action_hist[-2]) if len(action_hist) >= 2 else 0.0
-        ret = float(last_row["close"]) / prev_close - 1.0
-        trade_cost = (cfg["backtest"]["fee"] + cfg["backtest"]["slip"]) * abs(
-            prev_action - prev_prev_action
+        current_reward, _, _, _ = compute_step_reward(
+            float(prev_action),
+            float(prev_prev_action),
+            float(prev_close),
+            float(last_row["close"]),
+            reward_fee,
+            reward_slip,
+            reward_scale=reward_scale,
+            turnover_penalty=turnover_penalty,
+            position_penalty=position_penalty,
+            drawdown_penalty=drawdown_penalty,
+            equity=prev_equity,
+            max_equity=max_equity,
         )
-        current_reward = prev_action * ret - trade_cost
 
-    reward_window = np.zeros(seq_len, dtype=np.float32)
-    if reward_hist:
-        hist = reward_hist[-(seq_len - 1) :]
-        start = seq_len - 1 - len(hist)
-        reward_window[start : seq_len - 1] = hist
-    reward_window[-1] = current_reward
+    rtg_values = [float(target_return)]
+    current_rtg = float(target_return)
+    for past_reward in reward_hist:
+        current_rtg = update_rtg(current_rtg, past_reward, gamma)
+        rtg_values.append(current_rtg)
+    current_rtg = update_rtg(current_rtg, current_reward, gamma)
+    rtg_values.append(current_rtg)
+
+    rtg_window = np.zeros(seq_len, dtype=np.float32)
+    tail = rtg_values[-seq_len:]
+    rtg_window[-len(tail) :] = tail
+    rtg_window = rtg_window / rtg_scale
 
     with torch.no_grad():
         s = torch.tensor(state_window, device=device).unsqueeze(0)
-        r = torch.tensor(reward_window, device=device).unsqueeze(0)
+        r = torch.tensor(rtg_window, device=device).unsqueeze(0)
         if action_mode == "continuous":
             a = torch.tensor(actions_in, device=device).unsqueeze(0)
             logits = model(s, a, r)
@@ -282,11 +320,7 @@ def run_cycle(cfg, model, device, log_path):
         cfg["backtest"]["initial_cash"],
     )
 
-    peak_equity = equity
-    if os.path.exists(log_path):
-        log_df = pd.read_csv(log_path)
-        if not log_df.empty and "equity" in log_df.columns:
-            peak_equity = max(float(log_df["equity"].max()), equity)
+    peak_equity = max(max_equity, equity)
 
     max_dd = cfg["papertrade"]["max_drawdown_pct"]
     halted = peak_equity > 0 and equity < peak_equity * (1.0 - max_dd)
@@ -338,6 +372,7 @@ def run_cycle(cfg, model, device, log_path):
         "dry_run": dry_run,
     }
     log_row["reward"] = float(current_reward)
+    log_row["rtg"] = float(current_rtg)
 
     append_log(log_path, log_row)
 

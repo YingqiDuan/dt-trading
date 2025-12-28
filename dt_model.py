@@ -45,8 +45,8 @@ class DecisionTransformer(nn.Module):
             nn.Parameter(torch.zeros(act_dim)) if self.action_mode == "continuous" else None
         )
 
-    def forward(self, states, actions, rewards, return_values=False):
-        # states: (B, T, state_dim), actions: (B, T) or (B, T, act_dim), rewards: (B, T)
+    def forward(self, states, actions, rtg, return_values=False):
+        # states: (B, T, state_dim), actions: (B, T) or (B, T, act_dim), rtg: (B, T)
         bsz, tlen, _ = states.shape
         if tlen > self.seq_len:
             raise ValueError(f"sequence length {tlen} exceeds model max {self.seq_len}")
@@ -54,7 +54,7 @@ class DecisionTransformer(nn.Module):
         if self.action_mode == "continuous" and actions.dim() == 2:
             actions = actions.unsqueeze(-1)
 
-        rtg_tokens = self.rtg_emb(rewards.unsqueeze(-1))
+        rtg_tokens = self.rtg_emb(rtg.unsqueeze(-1))
         state_tokens = self.state_emb(states)
         if self.action_mode == "continuous":
             action_tokens = self.action_emb(actions.float())
