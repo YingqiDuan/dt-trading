@@ -22,9 +22,11 @@ features:
   macd_signal: 9
   rsi_window: 14
   volume_z_window: 24
-  zscore_window: 24
-  skip_zscore: [volume_z, boll_z]
+  log_return_cum_windows: [16, 96]  # 4h, 1d when timeframe=15m
+  zscore_window: 96
+  skip_zscore: [boll_z]
   include_log_return: true  # true|false
+  include_log_return_cum: true  # true|false
   include_volatility: true  # true|false
   include_volume: true  # true|false
   include_ema: true  # true|false

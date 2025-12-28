@@ -43,6 +43,14 @@ def build_features(df, cfg):
     )
     out["volume_z"] = rolling_zscore(out["volume"], cfg["volume_z_window"])
 
+    log_return_cum_windows = [int(w) for w in cfg.get("log_return_cum_windows", [])]
+    for window in log_return_cum_windows:
+        if window <= 0:
+            continue
+        out[f"log_return_cum_{window}"] = (
+            out["log_return"].rolling(window=window, min_periods=window).sum()
+        )
+
     ema_windows = [int(w) for w in cfg.get("ema_windows", [])]
     for window in ema_windows:
         out[f"ema_{window}"] = compute_ema(out["close"], window)
@@ -80,6 +88,11 @@ def build_features(df, cfg):
     feature_cols = []
     if cfg.get("include_log_return", True):
         feature_cols.append("log_return")
+    include_log_return_cum = cfg.get("include_log_return_cum", bool(log_return_cum_windows))
+    if include_log_return_cum:
+        for window in log_return_cum_windows:
+            if window > 0:
+                feature_cols.append(f"log_return_cum_{window}")
     if cfg.get("include_volatility", True):
         feature_cols.append("volatility")
     if cfg.get("include_volume", True):
@@ -98,6 +111,9 @@ def build_features(df, cfg):
 
     skip_zscore = set(cfg.get("skip_zscore", []))
     skip_zscore.add("volume_z")
+    for window in log_return_cum_windows:
+        if window > 0:
+            skip_zscore.add(f"log_return_cum_{window}")
     state_cols = []
     for col in feature_cols:
         if col in skip_zscore:
