@@ -1384,6 +1384,11 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    if cfg.get("walk_forward", {}).get("enabled", False):
+        from walk_forward import run_walk_forward
+
+        run_walk_forward(cfg)
+        return
     mode = args.mode or cfg.get("train", {}).get("mode", "offline")
     mode = str(mode).lower()
     if mode not in ("offline", "ppo"):

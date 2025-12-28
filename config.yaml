@@ -114,7 +114,7 @@ papertrade:
   api_secret_env: "BINANCE_API_SECRET"
 
 walk_forward:
-  enabled: false  # true|false
+  enabled: true  # true|false
   train_bars: 4320
   val_bars: 720
   test_bars: 720

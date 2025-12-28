@@ -1,4 +1,6 @@
 import argparse
+import csv
+import json
 import os
 
 import numpy as np
@@ -21,6 +23,76 @@ from train_dt import (
     train_epoch,
 )
 from utils import annualization_factor, ensure_dir, load_config, save_json, set_seed
+
+
+def summarize_metrics(folds):
+    metrics_by_key = {}
+    for fold in folds:
+        metrics = fold.get("metrics", {})
+        for key, value in metrics.items():
+            if isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(value):
+                metrics_by_key.setdefault(key, []).append(float(value))
+    summary = {}
+    for key, values in metrics_by_key.items():
+        arr = np.asarray(values, dtype=np.float64)
+        summary[key] = {
+            "mean": float(np.mean(arr)),
+            "std": float(np.std(arr)),
+            "min": float(np.min(arr)),
+            "max": float(np.max(arr)),
+        }
+    return summary
+
+
+def serialize_metric_value(value):
+    if isinstance(value, (np.integer, np.floating)):
+        return float(value)
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, sort_keys=True)
+    return value
+
+
+def write_summary_csv(path, folds):
+    if not folds:
+        return
+    base_fields = [
+        "fold",
+        "train_start",
+        "train_end",
+        "val_start",
+        "val_end",
+        "test_start",
+        "test_end",
+        "checkpoint",
+    ]
+    metric_keys = sorted({k for fold in folds for k in fold.get("metrics", {})})
+    fieldnames = base_fields + metric_keys
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for fold in folds:
+            row = {key: fold.get(key, "") for key in base_fields}
+            metrics = fold.get("metrics", {})
+            for key in metric_keys:
+                row[key] = serialize_metric_value(metrics.get(key, ""))
+            writer.writerow(row)
+
+
+def write_summary_md(path, summary, fold_count):
+    lines = ["# Walk-Forward Summary", "", f"- folds: {fold_count}", ""]
+    if not summary:
+        lines.append("No metrics available.")
+    else:
+        lines.append("| metric | mean | std | min | max |")
+        lines.append("| --- | --- | --- | --- | --- |")
+        for key in sorted(summary.keys()):
+            stats = summary[key]
+            lines.append(
+                f"| {key} | {stats['mean']:.6f} | {stats['std']:.6f} "
+                f"| {stats['min']:.6f} | {stats['max']:.6f} |"
+            )
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
 
 
 def train_for_fold_offline(cfg, train_df, val_df, state_cols, fold_dir, fold_seed):
@@ -162,12 +234,7 @@ def train_for_fold_offline(cfg, train_df, val_df, state_cols, fold_dir, fold_see
     return model, best_path, log_rows
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="config.yaml")
-    args = parser.parse_args()
-
-    cfg = load_config(args.config)
+def run_walk_forward(cfg):
     wf_cfg = cfg.get("walk_forward", {})
     if not wf_cfg.get("enabled", False):
         raise SystemExit("walk_forward.enabled is false; enable it in config.yaml")
@@ -272,9 +339,26 @@ def main():
             break
         start_idx += step_bars
 
+    summary["metric_summary"] = summarize_metrics(summary["folds"])
+
     summary_path = os.path.join(output_dir, "summary.json")
+    summary_csv_path = os.path.join(output_dir, "summary.csv")
+    summary_md_path = os.path.join(output_dir, "summary.md")
     save_json(summary_path, summary)
+    write_summary_csv(summary_csv_path, summary["folds"])
+    write_summary_md(summary_md_path, summary["metric_summary"], len(summary["folds"]))
     print(f"walk-forward summary saved to {summary_path}")
+    print(f"walk-forward summary saved to {summary_csv_path}")
+    print(f"walk-forward summary saved to {summary_md_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="config.yaml")
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+    run_walk_forward(cfg)
 
 
 if __name__ == "__main__":
