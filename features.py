@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import pandas as pd
 
@@ -33,6 +35,81 @@ def compute_macd(close, fast, slow, signal):
     macd_signal = macd_line.ewm(span=signal, adjust=False, min_periods=signal).mean()
     macd_hist = macd_line - macd_signal
     return macd_line, macd_signal, macd_hist
+
+
+def resolve_state_cols(cfg):
+    log_return_cum_windows = [int(w) for w in cfg.get("log_return_cum_windows", [])]
+    ema_windows = [int(w) for w in cfg.get("ema_windows", [])]
+
+    feature_cols = []
+    if cfg.get("include_log_return", True):
+        feature_cols.append("log_return")
+    include_log_return_cum = cfg.get("include_log_return_cum", bool(log_return_cum_windows))
+    if include_log_return_cum:
+        for window in log_return_cum_windows:
+            if window > 0:
+                feature_cols.append(f"log_return_cum_{window}")
+    if cfg.get("include_volatility", True):
+        feature_cols.append("volatility")
+    if cfg.get("include_volume", True):
+        feature_cols.append("volume_z")
+
+    include_price_to_ma = cfg.get("include_price_to_ma", True)
+    if include_price_to_ma:
+        feature_cols.append("price_to_ma")
+    include_rsi = cfg.get("include_rsi", True)
+    if include_rsi:
+        feature_cols.append("rsi")
+
+    if cfg.get("include_ema", bool(ema_windows)):
+        for window in ema_windows:
+            feature_cols.append(f"ema_{window}")
+
+    include_boll = cfg.get("include_boll", False)
+    if include_boll:
+        feature_cols.extend(["boll_z", "boll_width"])
+    include_macd = cfg.get("include_macd", False)
+    if include_macd:
+        feature_cols.extend(["macd_line", "macd_signal", "macd_hist"])
+
+    skip_zscore = set(cfg.get("skip_zscore", []))
+    skip_zscore.add("volume_z")
+    for window in log_return_cum_windows:
+        if window > 0:
+            skip_zscore.add(f"log_return_cum_{window}")
+
+    state_cols = []
+    for col in feature_cols:
+        if col in skip_zscore:
+            state_cols.append(col)
+        else:
+            state_cols.append(f"{col}_z")
+    return state_cols
+
+
+def load_feature_cache(cfg):
+    feature_dir = cfg.get("data", {}).get("feature_dir")
+    if not feature_dir:
+        return None, None
+
+    symbol = cfg["data"]["symbol"].replace("/", "")
+    tf = cfg["data"]["timeframe"]
+    feature_path = os.path.join(feature_dir, f"{symbol}_{tf}_features.csv")
+    if not os.path.exists(feature_path):
+        return None, None
+
+    state_cols = resolve_state_cols(cfg["features"])
+    df = pd.read_csv(feature_path)
+    if "datetime" in df.columns:
+        df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+    elif "timestamp" in df.columns:
+        df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    required_cols = ["close", "datetime"]
+    missing = [col for col in required_cols + state_cols if col not in df.columns]
+    if missing:
+        return None, None
+
+    return df, state_cols
 
 
 def build_features(df, cfg):

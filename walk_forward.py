@@ -12,7 +12,7 @@ except Exception:
 from backtest import action_distribution, compute_metrics, run_model_backtest
 from dataset_builder import load_or_fetch
 from dt_model import DecisionTransformer
-from features import build_features
+from features import build_features, load_feature_cache
 from train_dt import (
     TrajectoryDataset,
     build_trajectories,
@@ -189,8 +189,10 @@ def main():
     seed = int(cfg.get("rl", {}).get("seed", 42))
     set_seed(seed)
 
-    raw_df = load_or_fetch(cfg)
-    feat_df, state_cols = build_features(raw_df, cfg["features"])
+    feat_df, state_cols = load_feature_cache(cfg)
+    if feat_df is None:
+        raw_df = load_or_fetch(cfg)
+        feat_df, state_cols = build_features(raw_df, cfg["features"])
     feat_df = feat_df.dropna(subset=state_cols).reset_index(drop=True)
 
     total_len = len(feat_df)

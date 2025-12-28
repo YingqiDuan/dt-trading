@@ -21,7 +21,7 @@ from dt_utils import (
     compute_trajectory_rewards,
     update_rtg,
 )
-from features import build_features
+from features import build_features, load_feature_cache
 from market_env import MarketEnv
 from utils import ensure_dir, load_config, parse_date, save_json, set_seed
 
@@ -992,8 +992,10 @@ def evaluate_policy_ppo(
 
 
 def prepare_splits(cfg):
-    raw_df = load_or_fetch(cfg)
-    feat_df, state_cols = build_features(raw_df, cfg["features"])
+    feat_df, state_cols = load_feature_cache(cfg)
+    if feat_df is None:
+        raw_df = load_or_fetch(cfg)
+        feat_df, state_cols = build_features(raw_df, cfg["features"])
     feat_df = feat_df.dropna(subset=state_cols).reset_index(drop=True)
 
     train_end = parse_date(cfg["data"]["train_end"])
