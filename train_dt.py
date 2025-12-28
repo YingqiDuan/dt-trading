@@ -115,8 +115,12 @@ def build_trajectories(df, state_cols, cfg, action_mode, act_dim, rng):
     turnover_penalty = float(cfg.get("rl", {}).get("turnover_penalty", 0.0))
     position_penalty = float(cfg.get("rl", {}).get("position_penalty", 0.0))
     drawdown_penalty = float(cfg.get("rl", {}).get("drawdown_penalty", 0.0))
+    price_mode = cfg["rewards"].get("price_mode", "close")
+    range_penalty = float(cfg["rewards"].get("range_penalty", 0.0))
     fee = float(cfg["rewards"]["fee"])
     slip = float(cfg["rewards"]["slip"])
+    price_mode = cfg["rewards"].get("price_mode", "close")
+    range_penalty = float(cfg["rewards"].get("range_penalty", 0.0))
 
     if action_mode == "continuous" and act_dim != 1:
         raise ValueError("continuous action_mode currently supports action_dim=1")
@@ -124,6 +128,12 @@ def build_trajectories(df, state_cols, cfg, action_mode, act_dim, rng):
     actions = build_behavior_actions(df, cfg, action_mode, rng)
     states = df[state_cols].to_numpy(dtype=np.float32)
     close = df["close"].to_numpy(dtype=np.float32)
+    open_prices = df["open"].to_numpy(dtype=np.float32) if "open" in df.columns else None
+    high_prices = df["high"].to_numpy(dtype=np.float32) if "high" in df.columns else None
+    low_prices = df["low"].to_numpy(dtype=np.float32) if "low" in df.columns else None
+    open_prices = df["open"].to_numpy(dtype=np.float32) if "open" in df.columns else None
+    high_prices = df["high"].to_numpy(dtype=np.float32) if "high" in df.columns else None
+    low_prices = df["low"].to_numpy(dtype=np.float32) if "low" in df.columns else None
 
     trajectories = []
     start = 0
@@ -143,6 +153,11 @@ def build_trajectories(df, state_cols, cfg, action_mode, act_dim, rng):
             turnover_penalty=turnover_penalty,
             position_penalty=position_penalty,
             drawdown_penalty=drawdown_penalty,
+            open_=open_prices[start:end] if open_prices is not None else None,
+            high=high_prices[start:end] if high_prices is not None else None,
+            low=low_prices[start:end] if low_prices is not None else None,
+            price_mode=price_mode,
+            range_penalty=range_penalty,
         )
         rtg_ep = compute_rtg(rewards_ep, gamma) / rtg_scale
         trajectories.append(
@@ -387,6 +402,14 @@ def evaluate_policy(
                     drawdown_penalty=drawdown_penalty,
                     equity=equity,
                     max_equity=max_equity,
+                    price_mode=price_mode,
+                    open_t=float(open_prices[idx]) if open_prices is not None else None,
+                    high_t=float(high_prices[idx]) if high_prices is not None else None,
+                    low_t=float(low_prices[idx]) if low_prices is not None else None,
+                    open_t1=float(open_prices[idx + 1]) if open_prices is not None else None,
+                    high_t1=float(high_prices[idx + 1]) if high_prices is not None else None,
+                    low_t1=float(low_prices[idx + 1]) if low_prices is not None else None,
+                    range_penalty=range_penalty,
                 )
                 current_rtg = update_rtg(current_rtg, reward, gamma)
                 rtg_hist[idx + 1] = current_rtg
@@ -400,6 +423,10 @@ def evaluate_policy(
             cfg["backtest"]["fee"],
             cfg["backtest"]["slip"],
             cfg["backtest"]["initial_cash"],
+            open_prices=open_prices,
+            high_prices=high_prices,
+            low_prices=low_prices,
+            price_mode=price_mode,
         )
         annual_factor = 24 * 365
         return compute_metrics(equity_curve, step_returns, trade_count, turnover, annual_factor)

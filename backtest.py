@@ -30,10 +30,44 @@ def find_latest_checkpoint(ckpt_dir):
 
 
 
-def simulate(actions, close, fee, slip, initial_cash):
+def simulate(
+    actions,
+    close,
+    fee,
+    slip,
+    initial_cash,
+    open_prices=None,
+    high_prices=None,
+    low_prices=None,
+    price_mode="close",
+):
     actions = np.asarray(actions, dtype=np.float32).reshape(-1)
+    close = np.asarray(close, dtype=np.float32).reshape(-1)
+    if open_prices is not None:
+        open_prices = np.asarray(open_prices, dtype=np.float32).reshape(-1)
+    if high_prices is not None:
+        high_prices = np.asarray(high_prices, dtype=np.float32).reshape(-1)
+    if low_prices is not None:
+        low_prices = np.asarray(low_prices, dtype=np.float32).reshape(-1)
+
+    mode = str(price_mode or "close").lower()
+    price = close
+    if open_prices is not None and high_prices is not None and low_prices is not None:
+        if mode == "open":
+            price = open_prices
+        elif mode in ("hl2", "hl"):
+            price = 0.5 * (high_prices + low_prices)
+        elif mode == "oc2":
+            price = 0.5 * (open_prices + close)
+        elif mode == "ohlc4":
+            price = 0.25 * (open_prices + high_prices + low_prices + close)
+        elif mode == "typical":
+            price = (high_prices + low_prices + close) / 3.0
+        else:
+            price = close
+
     delta = np.diff(np.concatenate(([0], actions)))
-    returns = close[1:] / close[:-1] - 1.0
+    returns = price[1:] / price[:-1] - 1.0
     step_returns = np.zeros_like(actions, dtype=np.float32)
     step_returns[:-1] = actions[:-1] * returns - (fee + slip) * np.abs(delta[:-1])
 
@@ -99,6 +133,8 @@ def run_model_backtest(cfg, model, df, state_cols, device):
     turnover_penalty = float(cfg.get("rl", {}).get("turnover_penalty", 0.0))
     position_penalty = float(cfg.get("rl", {}).get("position_penalty", 0.0))
     drawdown_penalty = float(cfg.get("rl", {}).get("drawdown_penalty", 0.0))
+    price_mode = cfg["rewards"].get("price_mode", "close")
+    range_penalty = float(cfg["rewards"].get("range_penalty", 0.0))
 
     dataset_cfg = cfg.get("dataset", {})
     target_return = float(dataset_cfg.get("target_return", 0.0))
@@ -109,6 +145,9 @@ def run_model_backtest(cfg, model, df, state_cols, device):
 
     states = df[state_cols].to_numpy(dtype=np.float32)
     close = df["close"].to_numpy(dtype=np.float32)
+    open_prices = df["open"].to_numpy(dtype=np.float32) if "open" in df.columns else None
+    high_prices = df["high"].to_numpy(dtype=np.float32) if "high" in df.columns else None
+    low_prices = df["low"].to_numpy(dtype=np.float32) if "low" in df.columns else None
     timestamps = df["timestamp"].to_numpy(dtype=np.int64)
 
     if action_mode == "continuous":
@@ -167,6 +206,14 @@ def run_model_backtest(cfg, model, df, state_cols, device):
                 drawdown_penalty=drawdown_penalty,
                 equity=equity,
                 max_equity=max_equity,
+                price_mode=price_mode,
+                open_t=float(open_prices[idx]) if open_prices is not None else None,
+                high_t=float(high_prices[idx]) if high_prices is not None else None,
+                low_t=float(low_prices[idx]) if low_prices is not None else None,
+                open_t1=float(open_prices[idx + 1]) if open_prices is not None else None,
+                high_t1=float(high_prices[idx + 1]) if high_prices is not None else None,
+                low_t1=float(low_prices[idx + 1]) if low_prices is not None else None,
+                range_penalty=range_penalty,
             )
             current_rtg = update_rtg(current_rtg, reward, gamma)
             rtg_hist[idx + 1] = current_rtg
@@ -179,6 +226,10 @@ def run_model_backtest(cfg, model, df, state_cols, device):
         cfg["backtest"]["fee"],
         cfg["backtest"]["slip"],
         cfg["backtest"]["initial_cash"],
+        open_prices=open_prices,
+        high_prices=high_prices,
+        low_prices=low_prices,
+        price_mode=price_mode,
     )
 
     curve = pd.DataFrame(
@@ -284,6 +335,16 @@ def main():
             cfg["backtest"]["fee"],
             cfg["backtest"]["slip"],
             cfg["backtest"]["initial_cash"],
+            open_prices=test_df["open"].to_numpy(dtype=np.float32)
+            if "open" in test_df.columns
+            else None,
+            high_prices=test_df["high"].to_numpy(dtype=np.float32)
+            if "high" in test_df.columns
+            else None,
+            low_prices=test_df["low"].to_numpy(dtype=np.float32)
+            if "low" in test_df.columns
+            else None,
+            price_mode=cfg.get("rewards", {}).get("price_mode", "close"),
         )
         metrics[name] = compute_metrics(eq, ret, trades, turnover, annual_factor)
 

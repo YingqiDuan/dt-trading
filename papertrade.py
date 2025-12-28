@@ -170,6 +170,8 @@ def run_cycle(cfg, model, device, log_path):
     turnover_penalty = float(cfg.get("rl", {}).get("turnover_penalty", 0.0))
     position_penalty = float(cfg.get("rl", {}).get("position_penalty", 0.0))
     drawdown_penalty = float(cfg.get("rl", {}).get("drawdown_penalty", 0.0))
+    price_mode = cfg["rewards"].get("price_mode", "close")
+    range_penalty = float(cfg["rewards"].get("range_penalty", 0.0))
 
     dataset_cfg = cfg.get("dataset", {})
     target_return = float(dataset_cfg.get("target_return", 0.0))
@@ -259,11 +261,29 @@ def run_cycle(cfg, model, device, log_path):
         if not log_df.empty and "equity" in log_df.columns:
             max_equity = max(max_equity, float(log_df["equity"].max()))
 
+    prev_row = None
+    if last_log is not None:
+        last_ts = int(last_log.get("timestamp", 0))
+        match = feat_df[feat_df["timestamp"] == last_ts]
+        if not match.empty:
+            prev_row = match.iloc[-1]
+    if prev_row is None and len(feat_df) >= 2:
+        prev_row = feat_df.iloc[-2]
+
     current_reward = 0.0
     if last_log is not None:
-        prev_close = float(last_log.get("close", last_row["close"]))
+        if prev_row is not None and "close" in prev_row:
+            prev_close = float(prev_row["close"])
+        else:
+            prev_close = float(last_log.get("close", last_row["close"]))
         prev_action = float(last_log.get("action", 0.0))
         prev_prev_action = float(action_hist[-2]) if len(action_hist) >= 2 else 0.0
+        open_t = float(prev_row["open"]) if prev_row is not None and "open" in prev_row else None
+        high_t = float(prev_row["high"]) if prev_row is not None and "high" in prev_row else None
+        low_t = float(prev_row["low"]) if prev_row is not None and "low" in prev_row else None
+        open_t1 = float(last_row.get("open")) if "open" in last_row else None
+        high_t1 = float(last_row.get("high")) if "high" in last_row else None
+        low_t1 = float(last_row.get("low")) if "low" in last_row else None
         current_reward, _, _, _ = compute_step_reward(
             float(prev_action),
             float(prev_prev_action),
@@ -277,6 +297,14 @@ def run_cycle(cfg, model, device, log_path):
             drawdown_penalty=drawdown_penalty,
             equity=prev_equity,
             max_equity=max_equity,
+            price_mode=price_mode,
+            open_t=open_t,
+            high_t=high_t,
+            low_t=low_t,
+            open_t1=open_t1,
+            high_t1=high_t1,
+            low_t1=low_t1,
+            range_penalty=range_penalty,
         )
 
     rtg_values = [float(target_return)]

@@ -81,6 +81,7 @@ python walk_forward.py --config config.yaml
 - `rl.action_mode`: `discrete | continuous` (continuous uses tanh-squashed Gaussian, action_dim=1).
 - `dataset.behavior_policy`: offline action source (`ema_trend|random|buy_hold|flat`).
 - `dataset.target_return`, `dataset.rtg_scale`, `dataset.rtg_gamma`: RTG conditioning controls at inference time.
+- `rewards.price_mode`, `rewards.range_penalty`: bar pricing and volatility penalty for reward calculation.
 - `papertrade.base_url`: `https://fapi.binance.com | https://demo-fapi.binance.com`.
 - `walk_forward.*`: rolling window sizes in bars; outputs to `outputs/walk_forward/`.
 
