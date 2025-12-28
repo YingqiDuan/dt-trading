@@ -1,4 +1,5 @@
 import argparse
+import csv
 import os
 import time
 
@@ -39,6 +40,31 @@ def select_device(pref):
     if pref == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(pref)
+
+
+def make_run_id(cfg):
+    base = time.strftime("%Y%m%d_%H%M%S")
+    run_name = str(cfg.get("train", {}).get("run_name", "")).strip()
+    if not run_name:
+        return base
+    safe = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in run_name)
+    return f"{safe}_{base}"
+
+
+def write_csv_log(path, rows):
+    if not rows:
+        return
+    fieldnames = sorted({key for row in rows for key in row.keys()})
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def save_run_config(path, cfg, args, run_meta):
+    payload = {"config": cfg, "args": vars(args), "run_meta": run_meta}
+    save_json(path, payload)
 
 
 def action_to_index(actions):
@@ -1085,13 +1111,21 @@ def train_offline(cfg, args):
     log_rows = []
     best_val = -float("inf")
     best_loss = float("inf")
-    run_id = time.strftime("%Y%m%d_%H%M%S")
+    run_id = make_run_id(cfg)
+    run_meta = {
+        "run_id": run_id,
+        "mode": "offline",
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    train_cfg = cfg.get("train", {})
+    if train_cfg.get("save_config", True):
+        config_path = os.path.join(cfg["train"]["log_dir"], f"run_config_{run_id}.json")
+        save_run_config(config_path, cfg, args, run_meta)
 
     eval_every = int(cfg.get("rl", {}).get("eval_every", 1))
     has_val = val_df is not None and not val_df.empty
 
     epochs = int(cfg["train"]["epochs"])
-    train_cfg = cfg.get("train", {})
     train_progress = bool(train_cfg.get("train_progress", train_cfg.get("update_progress", False)))
     eval_progress = bool(train_cfg.get("eval_progress", False))
     epoch_iter = range(1, epochs + 1)
@@ -1176,6 +1210,9 @@ def train_offline(cfg, args):
 
     log_path = os.path.join(cfg["train"]["log_dir"], f"training_log_{run_id}.json")
     save_json(log_path, log_rows)
+    if train_cfg.get("track_csv", True):
+        csv_path = os.path.join(cfg["train"]["log_dir"], f"training_log_{run_id}.csv")
+        write_csv_log(csv_path, log_rows)
 
 
 def train_ppo(cfg, args):
@@ -1253,7 +1290,16 @@ def train_ppo(cfg, args):
 
     log_rows = []
     best_val = -float("inf")
-    run_id = time.strftime("%Y%m%d_%H%M%S")
+    run_id = make_run_id(cfg)
+    run_meta = {
+        "run_id": run_id,
+        "mode": "ppo",
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    train_cfg = cfg.get("train", {})
+    if train_cfg.get("save_config", True):
+        config_path = os.path.join(cfg["train"]["log_dir"], f"run_config_{run_id}.json")
+        save_run_config(config_path, cfg, args, run_meta)
 
     rollout_steps = int(cfg["rl"].get("rollout_steps", 2048))
     gamma = float(cfg["rl"].get("gamma", 0.99))
@@ -1262,7 +1308,6 @@ def train_ppo(cfg, args):
     has_val = val_df is not None and not val_df.empty
 
     epochs = int(cfg["train"]["epochs"])
-    train_cfg = cfg.get("train", {})
     rollout_progress = bool(train_cfg.get("rollout_progress", False))
     update_progress = bool(train_cfg.get("update_progress", False))
     eval_progress = bool(train_cfg.get("eval_progress", False))
@@ -1374,6 +1419,9 @@ def train_ppo(cfg, args):
 
     log_path = os.path.join(cfg["train"]["log_dir"], f"training_log_{run_id}.json")
     save_json(log_path, log_rows)
+    if train_cfg.get("track_csv", True):
+        csv_path = os.path.join(cfg["train"]["log_dir"], f"training_log_{run_id}.csv")
+        write_csv_log(csv_path, log_rows)
 
 
 def main():

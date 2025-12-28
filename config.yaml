@@ -70,6 +70,9 @@ train:
   device: auto  # auto|cpu|cuda
   log_dir: outputs/train
   checkpoint_dir: outputs/checkpoints
+  run_name: ""
+  track_csv: true
+  save_config: true
 
 rl:
   seed: 42
