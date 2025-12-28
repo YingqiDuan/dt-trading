@@ -10,6 +10,10 @@ data:
   limit: 1000
   raw_dir: data/raw
   feature_dir: data/features
+  integrity:
+    enabled: true
+    gap_policy: fill  # fill|warn|error
+    max_gap_bars: 1000
 
 features:
   volatility_window: 24
