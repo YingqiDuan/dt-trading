@@ -23,7 +23,14 @@ from dt_utils import (
 )
 from features import build_features, load_feature_cache
 from market_env import MarketEnv
-from utils import ensure_dir, load_config, parse_date, save_json, set_seed
+from utils import (
+    annualization_factor,
+    ensure_dir,
+    load_config,
+    parse_date,
+    save_json,
+    set_seed,
+)
 
 
 def select_device(pref):
@@ -119,6 +126,7 @@ def build_trajectories(df, state_cols, cfg, action_mode, act_dim, rng):
     drawdown_penalty = float(cfg.get("rl", {}).get("drawdown_penalty", 0.0))
     price_mode = cfg["rewards"].get("price_mode", "close")
     range_penalty = float(cfg["rewards"].get("range_penalty", 0.0))
+    risk_free = float(cfg.get("backtest", {}).get("risk_free", 0.0))
     fee = float(cfg["rewards"]["fee"])
     slip = float(cfg["rewards"]["slip"])
 
@@ -433,8 +441,16 @@ def evaluate_policy(
             low_prices=low_prices,
             price_mode=price_mode,
         )
-        annual_factor = 24 * 365
-        return compute_metrics(equity_curve, step_returns, trade_count, turnover, annual_factor)
+        annual_factor = annualization_factor(cfg["data"]["timeframe"])
+        return compute_metrics(
+            equity_curve,
+            step_returns,
+            trade_count,
+            turnover,
+            annual_factor,
+            actions=actions,
+            risk_free=risk_free,
+        )
 
     total_steps = len(df) * eval_samples
     pbar = None
@@ -833,6 +849,7 @@ def evaluate_policy_ppo(
     drawdown_penalty = float(cfg.get("rl", {}).get("drawdown_penalty", 0.0))
     price_mode = cfg["rewards"].get("price_mode", "close")
     range_penalty = float(cfg["rewards"].get("range_penalty", 0.0))
+    risk_free = float(cfg.get("backtest", {}).get("risk_free", 0.0))
 
     states = df[state_cols].to_numpy(dtype=np.float32)
     close = df["close"].to_numpy(dtype=np.float32)
@@ -944,8 +961,16 @@ def evaluate_policy_ppo(
             low_prices=low_prices,
             price_mode=price_mode,
         )
-        annual_factor = 24 * 365
-        return compute_metrics(equity, step_returns, trade_count, turnover, annual_factor)
+        annual_factor = annualization_factor(cfg["data"]["timeframe"])
+        return compute_metrics(
+            equity,
+            step_returns,
+            trade_count,
+            turnover,
+            annual_factor,
+            actions=actions,
+            risk_free=risk_free,
+        )
 
     total_steps = len(df) * eval_samples
     pbar = None

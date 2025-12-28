@@ -27,6 +27,29 @@ def to_ms(dt):
     return int(dt.timestamp() * 1000)
 
 
+def timeframe_to_seconds(timeframe):
+    unit = timeframe[-1]
+    amount = int(timeframe[:-1])
+    if unit == "m":
+        return amount * 60
+    if unit == "h":
+        return amount * 3600
+    if unit == "d":
+        return amount * 86_400
+    if unit == "w":
+        return amount * 7 * 86_400
+    if unit == "M":
+        return amount * 30 * 86_400
+    raise ValueError(f"unsupported timeframe {timeframe}")
+
+
+def annualization_factor(timeframe, days_per_year=365):
+    seconds_per_bar = timeframe_to_seconds(timeframe)
+    if seconds_per_bar <= 0:
+        raise ValueError(f"invalid timeframe {timeframe}")
+    return (days_per_year * 24 * 3600) / seconds_per_bar
+
+
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -49,4 +72,3 @@ def rolling_zscore(series, window):
 def save_json(path, payload):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
-

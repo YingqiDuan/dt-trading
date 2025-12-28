@@ -10,7 +10,7 @@ from dataset_builder import load_or_fetch
 from dt_model import DecisionTransformer
 from dt_utils import compute_step_reward, update_rtg
 from features import build_features
-from utils import ensure_dir, load_config, parse_date, save_json
+from utils import annualization_factor, ensure_dir, load_config, parse_date, save_json
 
 
 def action_to_index(actions):
@@ -81,27 +81,82 @@ def simulate(
     return equity, step_returns, trade_count, turnover
 
 
-def compute_metrics(equity, step_returns, trade_count, turnover, annual_factor):
-    total_return = equity[-1] / equity[0] - 1.0
-    ret_mean = np.mean(step_returns)
-    ret_std = np.std(step_returns)
+def compute_metrics(equity, step_returns, trade_count, turnover, annual_factor, actions=None, risk_free=0.0):
+    equity = np.asarray(equity, dtype=np.float64).reshape(-1)
+    step_returns = np.asarray(step_returns, dtype=np.float64).reshape(-1)
+    if equity.size == 0 or step_returns.size == 0 or equity[0] == 0:
+        return {
+            "total_return": 0.0,
+            "annual_return": 0.0,
+            "sharpe": 0.0,
+            "sortino": 0.0,
+            "max_drawdown": 0.0,
+            "calmar": 0.0,
+            "profit_factor": 0.0,
+            "win_rate": 0.0,
+            "exposure": 0.0,
+            "trade_count": int(trade_count),
+            "turnover": float(turnover),
+        }
+
+    total_return = float(equity[-1] / equity[0] - 1.0)
+    n_steps = max(1, step_returns.size - 1)
+    if equity[0] > 0 and equity[-1] > 0:
+        annual_return = float((equity[-1] / equity[0]) ** (annual_factor / n_steps) - 1.0)
+    else:
+        annual_return = 0.0
+
+    rf_per_step = float(risk_free) / annual_factor if annual_factor else 0.0
+    excess = step_returns - rf_per_step
+    ret_mean = float(np.mean(excess))
+    ret_std = float(np.std(excess))
     sharpe = 0.0 if ret_std == 0 else (ret_mean / ret_std) * np.sqrt(annual_factor)
+
+    downside = excess[excess < 0]
+    downside_std = float(np.std(downside)) if downside.size else 0.0
+    if downside_std == 0.0:
+        sortino = float("inf") if ret_mean > 0 else 0.0
+    else:
+        sortino = (ret_mean / downside_std) * np.sqrt(annual_factor)
 
     peak = np.maximum.accumulate(equity)
     drawdown = (equity - peak) / peak
     max_drawdown = float(drawdown.min())
+    if max_drawdown == 0.0:
+        calmar = float("inf") if annual_return > 0 else 0.0
+    else:
+        calmar = float(annual_return / abs(max_drawdown))
 
-    gains = step_returns[step_returns > 0].sum()
-    losses = -step_returns[step_returns < 0].sum()
+    gains = float(step_returns[step_returns > 0].sum())
+    losses = float(-step_returns[step_returns < 0].sum())
     profit_factor = float(gains / losses) if losses > 0 else float("inf")
 
+    win_rate = 0.0
+    exposure = 0.0
+    if actions is not None:
+        actions = np.asarray(actions, dtype=np.float64).reshape(-1)
+        n = min(actions.size, step_returns.size)
+        if n > 0:
+            actions = actions[:n]
+            step_returns_slice = step_returns[:n]
+            active = np.abs(actions) > 1e-8
+            exposure = float(np.mean(active))
+            active_returns = step_returns_slice[active]
+            if active_returns.size:
+                win_rate = float(np.mean(active_returns > 0))
+
     return {
-        "total_return": float(total_return),
+        "total_return": total_return,
+        "annual_return": annual_return,
         "sharpe": float(sharpe),
+        "sortino": float(sortino),
         "max_drawdown": max_drawdown,
+        "calmar": float(calmar),
         "profit_factor": profit_factor,
-        "trade_count": trade_count,
-        "turnover": turnover,
+        "win_rate": win_rate,
+        "exposure": exposure,
+        "trade_count": int(trade_count),
+        "turnover": float(turnover),
     }
 
 
@@ -286,8 +341,17 @@ def main():
         cfg, model, test_df, state_cols, device
     )
 
-    annual_factor = 24 * 365
-    dt_metrics = compute_metrics(equity, step_returns, trade_count, turnover, annual_factor)
+    annual_factor = annualization_factor(cfg["data"]["timeframe"])
+    risk_free = float(cfg["backtest"].get("risk_free", 0.0))
+    dt_metrics = compute_metrics(
+        equity,
+        step_returns,
+        trade_count,
+        turnover,
+        annual_factor,
+        actions=curve["action"].to_numpy(),
+        risk_free=risk_free,
+    )
     if model.action_mode == "continuous":
         actions = curve["action"].to_numpy(dtype=np.float32)
         dt_metrics["action_stats"] = {
@@ -346,7 +410,15 @@ def main():
             else None,
             price_mode=cfg.get("rewards", {}).get("price_mode", "close"),
         )
-        metrics[name] = compute_metrics(eq, ret, trades, turnover, annual_factor)
+        metrics[name] = compute_metrics(
+            eq,
+            ret,
+            trades,
+            turnover,
+            annual_factor,
+            actions=actions,
+            risk_free=risk_free,
+        )
 
     ensure_dir(cfg["backtest"]["output_dir"])
     curve_path = os.path.join(cfg["backtest"]["output_dir"], "equity_curve.csv")

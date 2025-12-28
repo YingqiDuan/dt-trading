@@ -20,7 +20,7 @@ from train_dt import (
     select_device,
     train_epoch,
 )
-from utils import ensure_dir, load_config, save_json, set_seed
+from utils import annualization_factor, ensure_dir, load_config, save_json, set_seed
 
 
 def train_for_fold_offline(cfg, train_df, val_df, state_cols, fold_dir, fold_seed):
@@ -227,9 +227,16 @@ def main():
             cfg, model, test_df, state_cols, device
         )
 
-        annual_factor = 24 * 365
+        annual_factor = annualization_factor(cfg["data"]["timeframe"])
+        risk_free = float(cfg.get("backtest", {}).get("risk_free", 0.0))
         dt_metrics = compute_metrics(
-            equity, step_returns, trade_count, turnover, annual_factor
+            equity,
+            step_returns,
+            trade_count,
+            turnover,
+            annual_factor,
+            actions=curve["action"].to_numpy(),
+            risk_free=risk_free,
         )
         if model.action_mode == "continuous":
             actions = curve["action"].to_numpy(dtype=np.float32)
