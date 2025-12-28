@@ -223,8 +223,8 @@ def run_model_backtest(cfg, model, df, state_cols, device):
     equity, step_returns, trade_count, turnover = simulate(
         actions,
         close,
-        cfg["backtest"]["fee"],
-        cfg["backtest"]["slip"],
+        cfg["rewards"]["fee"],
+        cfg["rewards"]["slip"],
         cfg["backtest"]["initial_cash"],
         open_prices=open_prices,
         high_prices=high_prices,
@@ -332,8 +332,8 @@ def main():
         eq, ret, trades, turnover = simulate(
             actions,
             close,
-            cfg["backtest"]["fee"],
-            cfg["backtest"]["slip"],
+            cfg["rewards"]["fee"],
+            cfg["rewards"]["slip"],
             cfg["backtest"]["initial_cash"],
             open_prices=test_df["open"].to_numpy(dtype=np.float32)
             if "open" in test_df.columns

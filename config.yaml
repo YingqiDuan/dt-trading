@@ -95,8 +95,6 @@ rl:
 
 backtest:
   initial_cash: 10000
-  fee: 0.0004
-  slip: 0.0002
   risk_free: 0.0
   ema_deadzone: 0.001
   random_stay_prob: 0.5

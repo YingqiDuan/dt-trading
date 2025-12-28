@@ -343,8 +343,8 @@ def run_cycle(cfg, model, device, log_path):
         prev_log,
         float(last_row["close"]),
         float(action),
-        cfg["backtest"]["fee"],
-        cfg["backtest"]["slip"],
+        cfg["rewards"]["fee"],
+        cfg["rewards"]["slip"],
         cfg["backtest"]["initial_cash"],
     )
 

@@ -425,8 +425,8 @@ def evaluate_policy(
         equity_curve, step_returns, trade_count, turnover = simulate(
             actions,
             close,
-            cfg["backtest"]["fee"],
-            cfg["backtest"]["slip"],
+            cfg["rewards"]["fee"],
+            cfg["rewards"]["slip"],
             cfg["backtest"]["initial_cash"],
             open_prices=open_prices,
             high_prices=high_prices,
@@ -936,8 +936,8 @@ def evaluate_policy_ppo(
         equity, step_returns, trade_count, turnover = simulate(
             actions,
             close,
-            cfg["backtest"]["fee"],
-            cfg["backtest"]["slip"],
+            cfg["rewards"]["fee"],
+            cfg["rewards"]["slip"],
             cfg["backtest"]["initial_cash"],
             open_prices=open_prices,
             high_prices=high_prices,
