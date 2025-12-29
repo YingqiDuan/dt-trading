@@ -22,7 +22,14 @@ from dt_utils import (
     compute_trajectory_rewards,
     update_rtg,
 )
-from features import build_features, load_feature_cache
+from features import (
+    build_features,
+    compute_bollinger,
+    compute_ema,
+    compute_macd,
+    compute_rsi,
+    load_feature_cache,
+)
 from market_env import MarketEnv
 from utils import (
     annualization_factor,
@@ -79,49 +86,209 @@ def atanh(x):
     return 0.5 * (torch.log1p(x) - torch.log1p(-x))
 
 
-def build_behavior_actions(df, cfg, action_mode, rng):
-    dataset_cfg = cfg.get("dataset", {})
-    policy = str(dataset_cfg.get("behavior_policy", "ema_trend")).lower()
+BEHAVIOR_POLICIES = (
+    "ema3_6_cross",
+    "ema9_12_cross",
+    "ema15_18_cross",
+    "boll_ema12_expansion",
+    "macd_signal_reversal",
+    "rsi_extremes",
+)
 
-    if policy == "ema_trend":
-        ema_windows = [int(w) for w in cfg.get("features", {}).get("ema_windows", [])]
-        ema_window = max(ema_windows) if ema_windows else None
-        ema_col = f"ema_{ema_window}" if ema_window else None
-        if not ema_col or ema_col not in df.columns:
-            print("behavior_policy=ema_trend but ema feature is missing; using flat actions")
-            actions = np.zeros(len(df), dtype=np.float32)
-        else:
-            deadzone = float(cfg.get("backtest", {}).get("ema_deadzone", 0.001))
-            close = df["close"].to_numpy(dtype=np.float32)
-            ema = df[ema_col].to_numpy(dtype=np.float32)
-            signal = close / ema - 1.0
-            actions = np.where(
-                signal > deadzone,
-                1.0,
-                np.where(signal < -deadzone, -1.0, 0.0),
-            )
-    elif policy == "buy_hold":
-        actions = np.ones(len(df), dtype=np.float32)
-    elif policy == "flat":
-        actions = np.zeros(len(df), dtype=np.float32)
-    elif policy == "random":
-        if action_mode == "continuous":
-            actions = rng.uniform(-1.0, 1.0, size=len(df)).astype(np.float32)
-        else:
-            stay_prob = float(cfg.get("backtest", {}).get("random_stay_prob", 0.5))
-            actions = np.zeros(len(df), dtype=np.int64)
-            for idx in range(1, len(df)):
-                if rng.rand() < stay_prob:
-                    actions[idx] = actions[idx - 1]
-                else:
-                    actions[idx] = int(rng.choice([-1, 0, 1]))
+
+def build_behavior_actions(df, cfg, action_mode, rng, policy_override=None):
+    dataset_cfg = cfg.get("dataset", {})
+    policy = str(policy_override or dataset_cfg.get("behavior_policy", "ema3_6_cross")).lower()
+    stop_loss = float(dataset_cfg.get("behavior_stop_loss", 0.1))
+
+    close = df["close"].to_numpy(dtype=np.float64)
+
+    def ema_series(window):
+        col = f"ema_{window}"
+        if col in df.columns:
+            return df[col].astype(float).to_numpy()
+        return compute_ema(df["close"], window).to_numpy(dtype=np.float64)
+
+    def rsi_series(window):
+        if "rsi" in df.columns:
+            return df["rsi"].astype(float).to_numpy()
+        return compute_rsi(df["close"], window).to_numpy(dtype=np.float64)
+
+    def macd_signal_series():
+        if "macd_signal" in df.columns:
+            return df["macd_signal"].astype(float).to_numpy()
+        macd_fast = int(cfg.get("features", {}).get("macd_fast", 12))
+        macd_slow = int(cfg.get("features", {}).get("macd_slow", 26))
+        macd_signal = int(cfg.get("features", {}).get("macd_signal", 9))
+        _, signal, _ = compute_macd(df["close"], macd_fast, macd_slow, macd_signal)
+        return signal.to_numpy(dtype=np.float64)
+
+    def boll_series():
+        boll_window = int(cfg.get("features", {}).get("boll_window", 20))
+        boll_n_std = float(cfg.get("features", {}).get("boll_n_std", 2.0))
+        mid, upper, lower, _ = compute_bollinger(df["close"], boll_window, boll_n_std)
+        width = (upper - lower) / (mid + 1e-12)
+        return (
+            mid.to_numpy(dtype=np.float64),
+            width.to_numpy(dtype=np.float64),
+        )
+
+    def apply_stop_loss(position, entry_price, price):
+        if position == 0.0 or entry_price <= 0:
+            return False
+        pnl = position * (price / entry_price - 1.0)
+        return pnl <= -stop_loss
+
+    def run_ema_cross(fast, slow):
+        fast = np.asarray(fast, dtype=np.float64)
+        slow = np.asarray(slow, dtype=np.float64)
+        actions = np.zeros(len(close), dtype=np.float64)
+        position = 0.0
+        entry_price = 0.0
+        for idx in range(len(close)):
+            if np.isnan(fast[idx]) or np.isnan(slow[idx]):
+                actions[idx] = 0.0 if position == 0.0 else position
+                continue
+            if position != 0.0 and apply_stop_loss(position, entry_price, close[idx]):
+                position = 0.0
+                entry_price = 0.0
+                actions[idx] = 0.0
+                continue
+            if position == 0.0 and idx > 0:
+                if not np.isnan(fast[idx - 1]) and not np.isnan(slow[idx - 1]):
+                    if fast[idx - 1] <= slow[idx - 1] and fast[idx] > slow[idx]:
+                        position = 1.0
+                        entry_price = close[idx]
+                    elif fast[idx - 1] >= slow[idx - 1] and fast[idx] < slow[idx]:
+                        position = -1.0
+                        entry_price = close[idx]
+            elif position == 1.0 and idx > 0:
+                if fast[idx] < fast[idx - 1]:
+                    position = 0.0
+                    entry_price = 0.0
+            elif position == -1.0 and idx > 0:
+                if fast[idx] > fast[idx - 1]:
+                    position = 0.0
+                    entry_price = 0.0
+            actions[idx] = position
+        return actions
+
+    def run_boll_ema12():
+        ema12 = ema_series(12)
+        mid, width = boll_series()
+        actions = np.zeros(len(close), dtype=np.float64)
+        position = 0.0
+        entry_price = 0.0
+        for idx in range(len(close)):
+            if np.isnan(ema12[idx]) or np.isnan(mid[idx]) or np.isnan(width[idx]):
+                actions[idx] = 0.0 if position == 0.0 else position
+                continue
+            if position != 0.0 and apply_stop_loss(position, entry_price, close[idx]):
+                position = 0.0
+                entry_price = 0.0
+                actions[idx] = 0.0
+                continue
+            if idx == 0 or np.isnan(width[idx - 1]):
+                actions[idx] = position
+                continue
+            expanding = width[idx] > width[idx - 1]
+            contracting = width[idx] < width[idx - 1]
+            if position == 0.0:
+                if expanding:
+                    if ema12[idx] > mid[idx]:
+                        position = 1.0
+                        entry_price = close[idx]
+                    elif ema12[idx] < mid[idx]:
+                        position = -1.0
+                        entry_price = close[idx]
+            else:
+                if contracting:
+                    position = 0.0
+                    entry_price = 0.0
+            actions[idx] = position
+        return actions
+
+    def run_macd_signal():
+        signal = macd_signal_series()
+        actions = np.zeros(len(close), dtype=np.float64)
+        position = 0.0
+        entry_price = 0.0
+        for idx in range(len(close)):
+            if np.isnan(signal[idx]):
+                actions[idx] = 0.0 if position == 0.0 else position
+                continue
+            if position != 0.0 and apply_stop_loss(position, entry_price, close[idx]):
+                position = 0.0
+                entry_price = 0.0
+                actions[idx] = 0.0
+                continue
+            if position == 0.0 and idx > 0 and not np.isnan(signal[idx - 1]):
+                if signal[idx - 1] <= 0.0 and signal[idx] > 0.0:
+                    position = 1.0
+                    entry_price = close[idx]
+                elif signal[idx - 1] >= 0.0 and signal[idx] < 0.0:
+                    position = -1.0
+                    entry_price = close[idx]
+            elif position == 1.0 and idx > 1:
+                if signal[idx - 1] > signal[idx - 2] and signal[idx] < signal[idx - 1]:
+                    position = 0.0
+                    entry_price = 0.0
+            elif position == -1.0 and idx > 1:
+                if signal[idx - 1] < signal[idx - 2] and signal[idx] > signal[idx - 1]:
+                    position = 0.0
+                    entry_price = 0.0
+            actions[idx] = position
+        return actions
+
+    def run_rsi_extremes():
+        rsi = rsi_series(int(cfg.get("features", {}).get("rsi_window", 14)))
+        actions = np.zeros(len(close), dtype=np.float64)
+        position = 0.0
+        entry_price = 0.0
+        for idx in range(len(close)):
+            if np.isnan(rsi[idx]):
+                actions[idx] = 0.0 if position == 0.0 else position
+                continue
+            if position != 0.0 and apply_stop_loss(position, entry_price, close[idx]):
+                position = 0.0
+                entry_price = 0.0
+                actions[idx] = 0.0
+                continue
+            if position == 0.0:
+                if rsi[idx] > 90.0:
+                    position = -1.0
+                    entry_price = close[idx]
+                elif rsi[idx] < 10.0:
+                    position = 1.0
+                    entry_price = close[idx]
+            elif position == 1.0:
+                if rsi[idx] > 70.0:
+                    position = 0.0
+                    entry_price = 0.0
+            elif position == -1.0:
+                if rsi[idx] < 30.0:
+                    position = 0.0
+                    entry_price = 0.0
+            actions[idx] = position
+        return actions
+
+    if policy == "ema3_6_cross":
+        actions = run_ema_cross(ema_series(3), ema_series(6))
+    elif policy == "ema9_12_cross":
+        actions = run_ema_cross(ema_series(9), ema_series(12))
+    elif policy == "ema15_18_cross":
+        actions = run_ema_cross(ema_series(15), ema_series(18))
+    elif policy == "boll_ema12_expansion":
+        actions = run_boll_ema12()
+    elif policy == "macd_signal_reversal":
+        actions = run_macd_signal()
+    elif policy == "rsi_extremes":
+        actions = run_rsi_extremes()
     else:
         raise ValueError(f"unsupported behavior_policy {policy}")
 
     if action_mode == "continuous":
-        if actions.dtype != np.float32:
-            actions = actions.astype(np.float32)
-        actions = np.clip(actions, -1.0, 1.0)
+        actions = np.clip(actions.astype(np.float32), -1.0, 1.0)
     else:
         actions = actions.astype(np.int64)
 
@@ -131,6 +298,7 @@ def build_behavior_actions(df, cfg, action_mode, rng):
 def build_trajectories(df, state_cols, cfg, action_mode, act_dim, rng):
     seq_len = int(cfg["dataset"]["seq_len"])
     dataset_cfg = cfg.get("dataset", {})
+    policy = str(dataset_cfg.get("behavior_policy", "mixed")).lower()
     episode_len = dataset_cfg.get("episode_len", None)
     if episode_len is None:
         episode_len = cfg.get("rl", {}).get("episode_len", None)
@@ -159,7 +327,42 @@ def build_trajectories(df, state_cols, cfg, action_mode, act_dim, rng):
     if action_mode == "continuous" and act_dim != 1:
         raise ValueError("continuous action_mode currently supports action_dim=1")
 
-    actions = build_behavior_actions(df, cfg, action_mode, rng)
+    if policy == "mixed":
+        mix_cfg = dataset_cfg.get("behavior_mix", None)
+        if mix_cfg is None:
+            policies = list(BEHAVIOR_POLICIES)
+            weights = np.ones(len(policies), dtype=np.float64)
+        elif isinstance(mix_cfg, dict):
+            policies = []
+            weights = []
+            for name, weight in mix_cfg.items():
+                policy_name = str(name).lower()
+                if policy_name not in BEHAVIOR_POLICIES:
+                    raise ValueError(f"unsupported behavior policy in mix: {policy_name}")
+                weight_val = float(weight)
+                if weight_val <= 0:
+                    raise ValueError(f"behavior_mix weight must be > 0 for {policy_name}")
+                policies.append(policy_name)
+                weights.append(weight_val)
+            weights = np.asarray(weights, dtype=np.float64)
+        elif isinstance(mix_cfg, (list, tuple)):
+            policies = [str(name).lower() for name in mix_cfg]
+            if not policies:
+                raise ValueError("behavior_mix list is empty")
+            for name in policies:
+                if name not in BEHAVIOR_POLICIES:
+                    raise ValueError(f"unsupported behavior policy in mix: {name}")
+            weights = np.ones(len(policies), dtype=np.float64)
+        else:
+            raise ValueError("behavior_mix must be a list or dict of weights")
+
+        weights = weights / weights.sum()
+        actions_by_policy = {
+            name: build_behavior_actions(df, cfg, action_mode, rng, policy_override=name)
+            for name in policies
+        }
+    else:
+        actions = build_behavior_actions(df, cfg, action_mode, rng, policy_override=policy)
     states = df[state_cols].to_numpy(dtype=np.float32)
     close = df["close"].to_numpy(dtype=np.float32)
     open_prices = df["open"].to_numpy(dtype=np.float32) if "open" in df.columns else None
@@ -173,7 +376,11 @@ def build_trajectories(df, state_cols, cfg, action_mode, act_dim, rng):
         end = min(start + episode_len, total_len)
         if end - start < seq_len:
             break
-        actions_ep = actions[start:end]
+        if policy == "mixed":
+            chosen = str(rng.choice(policies, p=weights)).lower()
+            actions_ep = actions_by_policy[chosen][start:end]
+        else:
+            actions_ep = actions[start:end]
         close_ep = close[start:end]
         rewards_ep = compute_trajectory_rewards(
             actions_ep,

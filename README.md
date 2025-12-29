@@ -85,7 +85,8 @@ python walk_forward.py --config config.yaml
 ## Config Tips
 
 - `rl.action_mode`: `discrete | continuous` (continuous uses tanh-squashed Gaussian, action_dim=1).
-- `dataset.behavior_policy`: offline action source (`ema_trend|random|buy_hold|flat`).
+- `dataset.behavior_policy`: offline action source (`mixed`), use `dataset.behavior_mix` to list strategies (list or dict of weights).
+- `dataset.behavior_stop_loss`: stop-loss threshold for behavior actions (e.g. 0.1 = 10%).
 - `dataset.target_return`, `dataset.rtg_scale`, `dataset.rtg_gamma`: RTG conditioning controls at inference time.
 - `rewards.price_mode`, `rewards.range_penalty`: bar pricing and volatility penalty for reward calculation.
 - `train.mode` or `--mode`: `offline | ppo`.

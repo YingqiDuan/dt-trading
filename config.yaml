@@ -48,7 +48,15 @@ rewards:
 dataset:
   seq_len: 128  # try 64 if memory/throughput is tight
   episode_len: 512  # null = full window
-  behavior_policy: ema_trend  # ema_trend|random|buy_hold|flat
+  behavior_policy: mixed  # mixed only
+  behavior_mix:
+    - ema3_6_cross
+    - ema9_12_cross
+    - ema15_18_cross
+    - boll_ema12_expansion
+    - macd_signal_reversal
+    - rsi_extremes
+  behavior_stop_loss: 0.1  # stop loss for behavior actions (10% drawdown)
   rtg_gamma: 1.0
   rtg_scale: 1.0
   target_return: 0.0
