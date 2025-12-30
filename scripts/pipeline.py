@@ -31,6 +31,8 @@ def find_latest_checkpoint(ckpt_dir):
 
 
 def parse_run_id(ckpt_path):
+    if not ckpt_path:
+        return time.strftime("%Y%m%d_%H%M%S")
     base = os.path.basename(ckpt_path)
     if base.startswith("dt_best_") and base.endswith(".pt"):
         return base[len("dt_best_") : -len(".pt")]
@@ -80,6 +82,9 @@ def main():
     parser.add_argument("--registry-path", default=None)
     parser.add_argument("--deploy-dir", default=None)
     args = parser.parse_args()
+    skip_backtest = args.skip_backtest
+    skip_register = args.skip_register
+    skip_deploy = args.skip_deploy
 
     cfg = load_config(args.config)
     pipeline_cfg = cfg.get("pipeline", {})
@@ -102,18 +107,27 @@ def main():
             cmd += ["--mode", args.mode]
         run_cmd(cmd, dry_run=args.dry_run)
 
-    ckpt_path = args.ckpt
-    if not ckpt_path:
-        ckpt_path = find_latest_checkpoint(cfg["train"]["checkpoint_dir"])
-    if not ckpt_path and not args.skip_backtest:
-        raise FileNotFoundError("no checkpoint found for backtest/deploy")
+    ckpt_path = args.ckpt or find_latest_checkpoint(cfg["train"]["checkpoint_dir"])
+    if ckpt_path is None and (not skip_backtest or not skip_register or not skip_deploy):
+        if args.dry_run:
+            if not skip_backtest:
+                print("!! no checkpoint found; skipping backtest in dry-run")
+                skip_backtest = True
+            if not skip_register:
+                print("!! no checkpoint found; skipping register in dry-run")
+                skip_register = True
+            if not skip_deploy:
+                print("!! no checkpoint found; skipping deploy in dry-run")
+                skip_deploy = True
+        else:
+            raise FileNotFoundError("no checkpoint found for backtest/register/deploy")
 
-    if not args.skip_backtest:
+    if not skip_backtest:
         cmd = [sys.executable, "backtest.py", "--config", args.config, "--ckpt", ckpt_path]
         run_cmd(cmd, dry_run=args.dry_run)
 
     metrics_path = os.path.join(cfg["backtest"]["output_dir"], "metrics.json")
-    if not args.skip_register:
+    if not skip_register:
         record = {
             "run_id": parse_run_id(ckpt_path),
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -128,7 +142,7 @@ def main():
         }
         append_registry(registry_path, record)
 
-    if not args.skip_deploy:
+    if not skip_deploy:
         if not ckpt_path:
             raise FileNotFoundError("no checkpoint found for deploy")
         os.makedirs(deploy_dir, exist_ok=True)
