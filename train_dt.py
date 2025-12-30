@@ -75,6 +75,125 @@ def save_run_config(path, cfg, args, run_meta):
     save_json(path, payload)
 
 
+def infer_metric_mode(metric_name):
+    if not metric_name:
+        return "max"
+    name = str(metric_name).lower()
+    if "loss" in name or "drawdown" in name:
+        return "min"
+    return "max"
+
+
+def get_metric_value(metric_name, train_loss=None, val_metrics=None, extra_metrics=None):
+    if not metric_name:
+        return None
+    name = str(metric_name)
+    if extra_metrics and name in extra_metrics:
+        return extra_metrics[name]
+    if val_metrics:
+        if name in val_metrics:
+            return val_metrics[name]
+        if name.startswith("val_"):
+            key = name[4:]
+            if key in val_metrics:
+                return val_metrics[key]
+    if name == "train_loss":
+        return train_loss
+    return None
+
+
+def init_lr_scheduler(optimizer, cfg, default_metric=None):
+    sched_cfg = cfg.get("train", {}).get("lr_scheduler", {})
+    sched_type = str(sched_cfg.get("type", "none")).lower()
+    if sched_type in ("none", "", "null"):
+        return None, None
+
+    metric = sched_cfg.get("metric", default_metric)
+    mode = str(sched_cfg.get("mode", infer_metric_mode(metric))).lower()
+    if sched_type == "plateau":
+        factor = float(sched_cfg.get("factor", 0.5))
+        patience = int(sched_cfg.get("patience", 5))
+        min_lr = float(sched_cfg.get("min_lr", 1e-6))
+        threshold = float(sched_cfg.get("threshold", 1e-4))
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode=mode,
+            factor=factor,
+            patience=patience,
+            min_lr=min_lr,
+            threshold=threshold,
+        )
+        return scheduler, {"type": "plateau", "metric": metric}
+
+    if sched_type == "cosine":
+        t_max = int(sched_cfg.get("t_max", cfg["train"]["epochs"]))
+        min_lr = float(sched_cfg.get("min_lr", 0.0))
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=t_max, eta_min=min_lr
+        )
+        return scheduler, {"type": "cosine"}
+
+    if sched_type == "step":
+        step_size = int(sched_cfg.get("step_size", 10))
+        gamma = float(sched_cfg.get("gamma", 0.5))
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer, step_size=step_size, gamma=gamma
+        )
+        return scheduler, {"type": "step"}
+
+    raise ValueError(f"unsupported lr_scheduler type {sched_type}")
+
+
+def step_lr_scheduler(scheduler, scheduler_info, metric_value):
+    if scheduler is None or not scheduler_info:
+        return
+    if scheduler_info["type"] == "plateau":
+        if metric_value is None:
+            return
+        scheduler.step(metric_value)
+    else:
+        scheduler.step()
+
+
+def init_early_stopping(cfg, default_metric=None):
+    early_cfg = cfg.get("train", {}).get("early_stopping", {})
+    if not early_cfg.get("enabled", False):
+        return None
+    metric = early_cfg.get("metric", default_metric)
+    mode = str(early_cfg.get("mode", infer_metric_mode(metric))).lower()
+    return {
+        "metric": metric,
+        "mode": mode,
+        "patience": int(early_cfg.get("patience", 10)),
+        "min_delta": float(early_cfg.get("min_delta", 0.0)),
+        "best": None,
+        "bad_epochs": 0,
+    }
+
+
+def update_early_stopping(state, metric_value):
+    if state is None or metric_value is None:
+        return False
+    if state["best"] is None:
+        state["best"] = float(metric_value)
+        state["bad_epochs"] = 0
+        return False
+
+    best = state["best"]
+    if state["mode"] == "min":
+        improved = metric_value < best - state["min_delta"]
+    else:
+        improved = metric_value > best + state["min_delta"]
+
+    if improved:
+        state["best"] = float(metric_value)
+        state["bad_epochs"] = 0
+        return False
+
+    state["bad_epochs"] += 1
+    return state["bad_epochs"] >= state["patience"]
+
+
 def aggregate_metrics(metrics_list, weights=None):
     if not metrics_list:
         return None
@@ -1414,6 +1533,10 @@ def train_offline(cfg, args):
         "target_return": float(dataset_cfg.get("target_return", 0.0)),
     }
 
+    default_metric = "val_total_return" if has_val else "train_loss"
+    scheduler, scheduler_info = init_lr_scheduler(optimizer, cfg, default_metric=default_metric)
+    early_stop = init_early_stopping(cfg, default_metric=default_metric)
+
     for epoch in epoch_iter:
         train_loss = train_epoch(
             model,
@@ -1468,16 +1591,28 @@ def train_offline(cfg, args):
             )
             torch.save(ckpt, best_path)
 
-        log_row = {"epoch": epoch, "train_loss": train_loss}
+        log_row = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "lr": float(optimizer.param_groups[0]["lr"]),
+        }
         if val_metrics is not None:
-            log_row.update(
-                {
-                    "val_total_return": val_metrics["total_return"],
-                    "val_sharpe": val_metrics["sharpe"],
-                    "val_max_drawdown": val_metrics["max_drawdown"],
-                    "val_datasets": val_metrics.get("datasets", 0),
-                }
-            )
+            for key in (
+                "total_return",
+                "annual_return",
+                "sharpe",
+                "sortino",
+                "max_drawdown",
+                "calmar",
+                "profit_factor",
+                "win_rate",
+                "exposure",
+                "trade_count",
+                "turnover",
+            ):
+                if key in val_metrics:
+                    log_row[f"val_{key}"] = val_metrics[key]
+            log_row["val_datasets"] = val_metrics.get("datasets", 0)
 
         log_rows.append(log_row)
 
@@ -1485,6 +1620,22 @@ def train_offline(cfg, args):
         if val_metrics is not None:
             val_str = f" val_total_return={val_metrics['total_return']:.4f}"
         print(f"epoch {epoch}: train_loss={train_loss:.6f}{val_str}")
+
+        sched_metric = get_metric_value(
+            scheduler_info.get("metric") if scheduler_info else None,
+            train_loss=train_loss,
+            val_metrics=val_metrics,
+        )
+        step_lr_scheduler(scheduler, scheduler_info, sched_metric)
+
+        stop_metric = get_metric_value(
+            early_stop["metric"] if early_stop else None,
+            train_loss=train_loss,
+            val_metrics=val_metrics,
+        )
+        if update_early_stopping(early_stop, stop_metric):
+            print("early stopping triggered")
+            break
 
     log_path = os.path.join(cfg["train"]["log_dir"], f"training_log_{run_id}.json")
     save_json(log_path, log_rows)
@@ -1609,6 +1760,10 @@ def train_ppo(cfg, args):
         "condition_mode": "reward",
     }
 
+    default_metric = "val_total_return" if has_val else "mean_episode_return"
+    scheduler, scheduler_info = init_lr_scheduler(optimizer, cfg, default_metric=default_metric)
+    early_stop = init_early_stopping(cfg, default_metric=default_metric)
+
     for epoch in epoch_iter:
         buffer = collect_rollout(
             train_env,
@@ -1678,15 +1833,24 @@ def train_ppo(cfg, args):
             "clip_frac": clip_frac,
             "mean_episode_return": mean_ep_return,
             "mean_episode_len": mean_ep_len,
+            "lr": float(optimizer.param_groups[0]["lr"]),
         }
         if val_metrics is not None:
-            log_row.update(
-                {
-                    "val_total_return": val_metrics["total_return"],
-                    "val_sharpe": val_metrics["sharpe"],
-                    "val_max_drawdown": val_metrics["max_drawdown"],
-                }
-            )
+            for key in (
+                "total_return",
+                "annual_return",
+                "sharpe",
+                "sortino",
+                "max_drawdown",
+                "calmar",
+                "profit_factor",
+                "win_rate",
+                "exposure",
+                "trade_count",
+                "turnover",
+            ):
+                if key in val_metrics:
+                    log_row[f"val_{key}"] = val_metrics[key]
 
         log_rows.append(log_row)
 
@@ -1698,6 +1862,31 @@ def train_ppo(cfg, args):
             f"entropy={entropy:.4f} approx_kl={approx_kl:.4f} clip_frac={clip_frac:.3f} "
             f"mean_ep_return={mean_ep_return:.4f}{val_str}"
         )
+
+        extra_metrics = {
+            "mean_episode_return": mean_ep_return,
+            "mean_episode_len": mean_ep_len,
+            "policy_loss": policy_loss,
+            "value_loss": value_loss,
+            "entropy": entropy,
+            "approx_kl": approx_kl,
+            "clip_frac": clip_frac,
+        }
+        sched_metric = get_metric_value(
+            scheduler_info.get("metric") if scheduler_info else None,
+            val_metrics=val_metrics,
+            extra_metrics=extra_metrics,
+        )
+        step_lr_scheduler(scheduler, scheduler_info, sched_metric)
+
+        stop_metric = get_metric_value(
+            early_stop["metric"] if early_stop else None,
+            val_metrics=val_metrics,
+            extra_metrics=extra_metrics,
+        )
+        if update_early_stopping(early_stop, stop_metric):
+            print("early stopping triggered")
+            break
 
     log_path = os.path.join(cfg["train"]["log_dir"], f"training_log_{run_id}.json")
     save_json(log_path, log_rows)
