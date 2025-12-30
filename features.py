@@ -1,19 +1,15 @@
 import os
-
 import numpy as np
 import pandas as pd
-
 from utils import rolling_zscore
 
 
 def compute_rsi(close, window):
     delta = close.diff()
-    gain = delta.clip(lower=0.0)
-    loss = -delta.clip(upper=0.0)
-    avg_gain = gain.rolling(window=window, min_periods=window).mean()
-    avg_loss = loss.rolling(window=window, min_periods=window).mean()
-    rs = avg_gain / (avg_loss + 1e-12)
-    return 100.0 - (100.0 / (1.0 + rs))
+    roll = lambda s: s.ewm(alpha=1.0 / window, min_periods=window, adjust=False).mean()
+    gain = roll(delta.clip(lower=0.0))
+    loss = roll(-delta.clip(upper=0.0))
+    return 100.0 - (100.0 / (1.0 + gain / (loss + 1e-12)))
 
 
 def compute_ema(series, window):
@@ -21,92 +17,79 @@ def compute_ema(series, window):
 
 
 def compute_bollinger(close, window, n_std):
-    mid = close.rolling(window=window, min_periods=window).mean()
-    std = close.rolling(window=window, min_periods=window).std(ddof=0)
-    upper = mid + n_std * std
-    lower = mid - n_std * std
-    return mid, upper, lower, std
+    mid = close.rolling(window, min_periods=window).mean()
+    std = close.rolling(window, min_periods=window).std(ddof=0)
+    return mid, mid + n_std * std, mid - n_std * std, std
 
 
 def compute_macd(close, fast, slow, signal):
-    ema_fast = compute_ema(close, fast)
-    ema_slow = compute_ema(close, slow)
-    macd_line = ema_fast - ema_slow
-    macd_signal = macd_line.ewm(span=signal, adjust=False, min_periods=signal).mean()
-    macd_hist = macd_line - macd_signal
-    return macd_line, macd_signal, macd_hist
+    fast_ma, slow_ma = compute_ema(close, fast), compute_ema(close, slow)
+    macd = fast_ma - slow_ma
+    sig = macd.ewm(span=signal, adjust=False, min_periods=signal).mean()
+    return macd, sig, macd - sig
+
+
+def _resolve_cols(cfg):
+    log_cum_wins = [int(w) for w in cfg.get("log_return_cum_windows", [])]
+    ema_wins = [int(w) for w in cfg.get("ema_windows", [])]
+
+    # 1. 确定启用的特征列
+    # 辅助检查函数，默认值为 True
+    check = lambda k, d=True: cfg.get(k, d)
+
+    cols = []
+    if check("include_log_return"):
+        cols.append("log_return")
+    if cfg.get("include_log_return_cum", bool(log_cum_wins)):
+        cols.extend(f"log_return_cum_{w}" for w in log_cum_wins if w > 0)
+    if check("include_volatility"):
+        cols.append("volatility")
+    if check("include_volume"):
+        cols.append("volume_z")
+    if check("include_price_to_ma"):
+        cols.append("price_to_ma")
+    if check("include_rsi"):
+        cols.append("rsi")
+    if check("include_ema", bool(ema_wins)):
+        cols.extend(f"ema_{w}" for w in ema_wins)
+    if check("include_boll", False):
+        cols.extend(["boll_z", "boll_width"])
+    if check("include_macd", False):
+        cols.extend(["macd_line", "macd_signal", "macd_hist"])
+
+    # 2. 确定不进行 Z-Score 标准化的列
+    skip = set(cfg.get("skip_zscore", [])) | {"volume_z", "boll_z", "boll_width"}
+    skip.update(f"log_return_cum_{w}" for w in log_cum_wins if w > 0)
+
+    return cols, skip
 
 
 def resolve_state_cols(cfg):
-    log_return_cum_windows = [int(w) for w in cfg.get("log_return_cum_windows", [])]
-    ema_windows = [int(w) for w in cfg.get("ema_windows", [])]
-
-    feature_cols = []
-    if cfg.get("include_log_return", True):
-        feature_cols.append("log_return")
-    include_log_return_cum = cfg.get("include_log_return_cum", bool(log_return_cum_windows))
-    if include_log_return_cum:
-        for window in log_return_cum_windows:
-            if window > 0:
-                feature_cols.append(f"log_return_cum_{window}")
-    if cfg.get("include_volatility", True):
-        feature_cols.append("volatility")
-    if cfg.get("include_volume", True):
-        feature_cols.append("volume_z")
-
-    include_price_to_ma = cfg.get("include_price_to_ma", True)
-    if include_price_to_ma:
-        feature_cols.append("price_to_ma")
-    include_rsi = cfg.get("include_rsi", True)
-    if include_rsi:
-        feature_cols.append("rsi")
-
-    if cfg.get("include_ema", bool(ema_windows)):
-        for window in ema_windows:
-            feature_cols.append(f"ema_{window}")
-
-    include_boll = cfg.get("include_boll", False)
-    if include_boll:
-        feature_cols.extend(["boll_z", "boll_width"])
-    include_macd = cfg.get("include_macd", False)
-    if include_macd:
-        feature_cols.extend(["macd_line", "macd_signal", "macd_hist"])
-
-    skip_zscore = set(cfg.get("skip_zscore", []))
-    skip_zscore.add("volume_z")
-    for window in log_return_cum_windows:
-        if window > 0:
-            skip_zscore.add(f"log_return_cum_{window}")
-
-    state_cols = []
-    for col in feature_cols:
-        if col in skip_zscore:
-            state_cols.append(col)
-        else:
-            state_cols.append(f"{col}_z")
-    return state_cols
+    cols, skip = _resolve_cols(cfg)
+    return [c if c in skip else f"{c}_z" for c in cols]
 
 
 def load_feature_cache(cfg, symbol=None, timeframe=None):
-    feature_dir = cfg.get("data", {}).get("feature_dir")
-    if not feature_dir:
+    f_dir = cfg.get("data", {}).get("feature_dir")
+    if not f_dir:
         return None, None
 
-    symbol = (symbol or cfg["data"]["symbol"]).replace("/", "")
+    sym = (symbol or cfg["data"]["symbol"]).replace("/", "")
     tf = timeframe or cfg["data"]["timeframe"]
-    feature_path = os.path.join(feature_dir, f"{symbol}_{tf}_features.csv")
-    if not os.path.exists(feature_path):
+    path = os.path.join(f_dir, f"{sym}_{tf}_features.csv")
+
+    if not os.path.exists(path):
         return None, None
 
+    df = pd.read_csv(path)
+    # 兼容 timestamp (ms) 和 datetime 格式
+    ts_col = "datetime" if "datetime" in df.columns else "timestamp"
+    unit = "ms" if ts_col == "timestamp" else None
+    df["datetime"] = pd.to_datetime(df[ts_col], unit=unit, utc=True)
+
+    # 检查完整性
     state_cols = resolve_state_cols(cfg["features"])
-    df = pd.read_csv(feature_path)
-    if "datetime" in df.columns:
-        df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
-    elif "timestamp" in df.columns:
-        df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    required_cols = ["close", "datetime"]
-    missing = [col for col in required_cols + state_cols if col not in df.columns]
-    if missing:
+    if any(c not in df.columns for c in ["close", "datetime"] + state_cols):
         return None, None
 
     return df, state_cols
@@ -114,91 +97,58 @@ def load_feature_cache(cfg, symbol=None, timeframe=None):
 
 def build_features(df, cfg):
     out = df.copy()
-    out["log_return"] = np.log(out["close"] / out["close"].shift(1))
+    close = out["close"]
+
+    # --- 基础特征计算 ---
+    out["log_return"] = np.log(close / close.shift(1))
+
+    vol_win = cfg["volatility_window"]
     out["volatility"] = (
-        out["log_return"].rolling(window=cfg["volatility_window"], min_periods=cfg["volatility_window"]).std(ddof=0)
+        out["log_return"].rolling(vol_win, min_periods=vol_win).std(ddof=0)
     )
+
     out["volume_z"] = rolling_zscore(out["volume"], cfg["volume_z_window"])
 
-    log_return_cum_windows = [int(w) for w in cfg.get("log_return_cum_windows", [])]
-    for window in log_return_cum_windows:
-        if window <= 0:
-            continue
-        out[f"log_return_cum_{window}"] = (
-            out["log_return"].rolling(window=window, min_periods=window).sum()
+    for w in [int(x) for x in cfg.get("log_return_cum_windows", []) if x > 0]:
+        out[f"log_return_cum_{w}"] = out["log_return"].rolling(w, min_periods=w).sum()
+
+    for w in [int(x) for x in cfg.get("ema_windows", [])]:
+        out[f"ema_{w}"] = compute_ema(close, w)
+
+    if cfg.get("include_price_to_ma", False):
+        mw = int(cfg.get("ma_window", 24))
+        out["price_to_ma"] = close / close.rolling(mw, min_periods=mw).mean() - 1.0
+
+    if cfg.get("include_rsi", False):
+        out["rsi"] = compute_rsi(close, cfg["rsi_window"])
+
+    if cfg.get("include_boll", False):
+        mid, up, low, std = compute_bollinger(
+            close, int(cfg.get("boll_window", 20)), float(cfg.get("boll_n_std", 2.0))
         )
+        out["boll_z"] = (close - mid) / (std + 1e-12)
+        out["boll_width"] = (up - low) / (mid + 1e-12)
 
-    ema_windows = [int(w) for w in cfg.get("ema_windows", [])]
-    for window in ema_windows:
-        out[f"ema_{window}"] = compute_ema(out["close"], window)
-
-    include_price_to_ma = cfg.get("include_price_to_ma", True)
-    if include_price_to_ma:
-        ma_window = int(cfg.get("ma_window", 24))
-        out["ma"] = out["close"].rolling(window=ma_window, min_periods=ma_window).mean()
-        out["price_to_ma"] = out["close"] / out["ma"] - 1.0
-
-    include_rsi = cfg.get("include_rsi", True)
-    if include_rsi:
-        out["rsi"] = compute_rsi(out["close"], cfg["rsi_window"])
-
-    include_boll = cfg.get("include_boll", False)
-    if include_boll:
-        boll_window = int(cfg.get("boll_window", 20))
-        boll_n_std = float(cfg.get("boll_n_std", 2.0))
-        mid, upper, lower, std = compute_bollinger(out["close"], boll_window, boll_n_std)
-        out["boll_z"] = (out["close"] - mid) / (std + 1e-12)
-        out["boll_width"] = (upper - lower) / (mid + 1e-12)
-
-    include_macd = cfg.get("include_macd", False)
-    if include_macd:
-        macd_fast = int(cfg.get("macd_fast", 12))
-        macd_slow = int(cfg.get("macd_slow", 26))
-        macd_signal = int(cfg.get("macd_signal", 9))
-        macd_line, macd_sig, macd_hist = compute_macd(
-            out["close"], macd_fast, macd_slow, macd_signal
+    if cfg.get("include_macd", False):
+        m_l, m_s, m_h = compute_macd(
+            close,
+            int(cfg.get("macd_fast", 12)),
+            int(cfg.get("macd_slow", 26)),
+            int(cfg.get("macd_signal", 9)),
         )
-        out["macd_line"] = macd_line
-        out["macd_signal"] = macd_sig
-        out["macd_hist"] = macd_hist
+        out["macd_line"], out["macd_signal"], out["macd_hist"] = m_l, m_s, m_h
 
-    feature_cols = []
-    if cfg.get("include_log_return", True):
-        feature_cols.append("log_return")
-    include_log_return_cum = cfg.get("include_log_return_cum", bool(log_return_cum_windows))
-    if include_log_return_cum:
-        for window in log_return_cum_windows:
-            if window > 0:
-                feature_cols.append(f"log_return_cum_{window}")
-    if cfg.get("include_volatility", True):
-        feature_cols.append("volatility")
-    if cfg.get("include_volume", True):
-        feature_cols.append("volume_z")
-    if include_price_to_ma:
-        feature_cols.append("price_to_ma")
-    if include_rsi:
-        feature_cols.append("rsi")
-    if cfg.get("include_ema", bool(ema_windows)):
-        for window in ema_windows:
-            feature_cols.append(f"ema_{window}")
-    if include_boll:
-        feature_cols.extend(["boll_z", "boll_width"])
-    if include_macd:
-        feature_cols.extend(["macd_line", "macd_signal", "macd_hist"])
+    # --- 特征筛选与标准化 ---
+    cols, skip = _resolve_cols(cfg)
+    final_cols = []
 
-    skip_zscore = set(cfg.get("skip_zscore", []))
-    skip_zscore.add("volume_z")
-    for window in log_return_cum_windows:
-        if window > 0:
-            skip_zscore.add(f"log_return_cum_{window}")
-    state_cols = []
-    for col in feature_cols:
-        if col in skip_zscore:
-            state_cols.append(col)
-            continue
-        z = rolling_zscore(out[col], cfg["zscore_window"])
-        name = f"{col}_z"
-        out[name] = z
-        state_cols.append(name)
+    for c in cols:
+        if c in skip:
+            final_cols.append(c)
+        else:
+            # 仅对未在 skip 列表中的特征进行 Z-Score
+            z_name = f"{c}_z"
+            out[z_name] = rolling_zscore(out[c], cfg["zscore_window"])
+            final_cols.append(z_name)
 
-    return out, state_cols
+    return out, final_cols

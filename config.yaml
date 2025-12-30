@@ -26,7 +26,7 @@ features:
   macd_fast: 12
   macd_slow: 24
   macd_signal: 9
-  rsi_window: 14
+  rsi_window: 12
   volume_z_window: 24
   log_return_cum_windows: [16, 96]  # 4h, 1d when timeframe=15m
   zscore_window: 96
