@@ -36,6 +36,7 @@ from utils import (
     ensure_dir,
     load_config,
     parse_date,
+    resolve_data_sources,
     save_json,
     set_seed,
 )
@@ -72,6 +73,36 @@ def write_csv_log(path, rows):
 def save_run_config(path, cfg, args, run_meta):
     payload = {"config": cfg, "args": vars(args), "run_meta": run_meta}
     save_json(path, payload)
+
+
+def aggregate_metrics(metrics_list, weights=None):
+    if not metrics_list:
+        return None
+    if weights is None:
+        weights = [1.0] * len(metrics_list)
+    weights = np.asarray(weights, dtype=np.float64)
+    if np.sum(weights) <= 0:
+        weights = np.ones_like(weights)
+
+    keys = set()
+    for metrics in metrics_list:
+        for key, value in metrics.items():
+            if isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(value):
+                keys.add(key)
+
+    summary = {}
+    for key in sorted(keys):
+        vals = []
+        wts = []
+        for metrics, weight in zip(metrics_list, weights):
+            value = metrics.get(key)
+            if isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(value):
+                vals.append(float(value))
+                wts.append(float(weight))
+        if wts:
+            summary[key] = float(np.average(vals, weights=wts))
+    summary["datasets"] = len(metrics_list)
+    return summary
 
 
 def action_to_index(actions):
@@ -320,7 +351,6 @@ def build_trajectories(df, state_cols, cfg, action_mode, act_dim, rng):
     drawdown_penalty = float(cfg.get("rl", {}).get("drawdown_penalty", 0.0))
     price_mode = cfg["rewards"].get("price_mode", "close")
     range_penalty = float(cfg["rewards"].get("range_penalty", 0.0))
-    risk_free = float(cfg.get("backtest", {}).get("risk_free", 0.0))
     fee = float(cfg["rewards"]["fee"])
     slip = float(cfg["rewards"]["slip"])
 
@@ -528,6 +558,7 @@ def evaluate_policy(
     device,
     action_mode,
     act_dim,
+    timeframe=None,
     progress=False,
     progress_desc=None,
     progress_position=0,
@@ -674,7 +705,7 @@ def evaluate_policy(
             low_prices=low_prices,
             price_mode=price_mode,
         )
-        annual_factor = annualization_factor(cfg["data"]["timeframe"])
+        annual_factor = annualization_factor(timeframe or cfg["data"]["timeframe"])
         return compute_metrics(
             equity_curve,
             step_returns,
@@ -1066,6 +1097,7 @@ def evaluate_policy_ppo(
     device,
     action_mode,
     act_dim,
+    timeframe=None,
     progress=False,
     progress_desc=None,
     progress_position=0,
@@ -1194,7 +1226,7 @@ def evaluate_policy_ppo(
             low_prices=low_prices,
             price_mode=price_mode,
         )
-        annual_factor = annualization_factor(cfg["data"]["timeframe"])
+        annual_factor = annualization_factor(timeframe or cfg["data"]["timeframe"])
         return compute_metrics(
             equity,
             step_returns,
@@ -1250,28 +1282,49 @@ def evaluate_policy_ppo(
 
 
 def prepare_splits(cfg):
-    feat_df, state_cols = load_feature_cache(cfg)
-    if feat_df is None:
-        raw_df = load_or_fetch(cfg)
-        feat_df, state_cols = build_features(raw_df, cfg["features"])
-    feat_df = feat_df.dropna(subset=state_cols).reset_index(drop=True)
+    sources = resolve_data_sources(cfg)
+    if not sources:
+        raise ValueError("no data sources configured")
 
+    splits = []
+    state_cols = None
     train_end = parse_date(cfg["data"]["train_end"])
     val_end = parse_date(cfg["data"].get("val_end", cfg["data"]["train_end"]))
     test_end = parse_date(cfg["data"]["test_end"])
-    train_df, val_df, _ = split_by_time(feat_df, train_end, val_end, test_end)
 
-    if len(train_df) < 2:
-        raise ValueError("train split too small")
+    for symbol, timeframe in sources:
+        feat_df, local_state_cols = load_feature_cache(cfg, symbol=symbol, timeframe=timeframe)
+        if feat_df is None:
+            raw_df = load_or_fetch(cfg, symbol=symbol, timeframe=timeframe)
+            feat_df, local_state_cols = build_features(raw_df, cfg["features"])
+        feat_df = feat_df.dropna(subset=local_state_cols).reset_index(drop=True)
 
-    return train_df, val_df, state_cols
+        if state_cols is None:
+            state_cols = local_state_cols
+        elif state_cols != local_state_cols:
+            raise ValueError("state_cols mismatch across data sources")
+
+        train_df, val_df, _ = split_by_time(feat_df, train_end, val_end, test_end)
+        if len(train_df) < 2:
+            raise ValueError(f"train split too small for {symbol} {timeframe}")
+
+        splits.append(
+            {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "train": train_df,
+                "val": val_df,
+            }
+        )
+
+    return splits, state_cols
 
 
 def train_offline(cfg, args):
     seed = int(cfg.get("rl", {}).get("seed", 42))
     set_seed(seed)
 
-    train_df, val_df, state_cols = prepare_splits(cfg)
+    splits, state_cols = prepare_splits(cfg)
 
     device = select_device(cfg["train"]["device"])
     action_mode = str(cfg.get("rl", {}).get("action_mode", "discrete")).lower()
@@ -1304,7 +1357,13 @@ def train_offline(cfg, args):
     )
 
     rng = np.random.RandomState(seed)
-    trajectories = build_trajectories(train_df, state_cols, cfg, action_mode, act_dim, rng)
+    trajectories = []
+    for split in splits:
+        trajectories.extend(
+            build_trajectories(
+                split["train"], state_cols, cfg, action_mode, act_dim, rng
+            )
+        )
     dataset = TrajectoryDataset(trajectories, cfg["dataset"]["seq_len"], action_mode, act_dim)
     if len(dataset) == 0:
         raise ValueError("no training windows available; check seq_len/episode_len")
@@ -1330,7 +1389,7 @@ def train_offline(cfg, args):
         save_run_config(config_path, cfg, args, run_meta)
 
     eval_every = int(cfg.get("rl", {}).get("eval_every", 1))
-    has_val = val_df is not None and not val_df.empty
+    has_val = any(split["val"] is not None and not split["val"].empty for split in splits)
 
     epochs = int(cfg["train"]["epochs"])
     train_progress = bool(train_cfg.get("train_progress", train_cfg.get("update_progress", False)))
@@ -1371,19 +1430,30 @@ def train_offline(cfg, args):
 
         val_metrics = None
         if has_val and eval_every > 0 and epoch % eval_every == 0:
-            val_metrics = evaluate_policy(
-                cfg,
-                model,
-                val_df,
-                state_cols,
-                device,
-                action_mode,
-                act_dim,
-                progress=eval_progress,
-                progress_desc=f"eval {epoch}",
-                progress_position=progress_position,
-            )
-            if val_metrics is not None and val_metrics["total_return"] > best_val:
+            metrics_list = []
+            weights = []
+            for split in splits:
+                val_df = split["val"]
+                if val_df is None or val_df.empty:
+                    continue
+                metrics = evaluate_policy(
+                    cfg,
+                    model,
+                    val_df,
+                    state_cols,
+                    device,
+                    action_mode,
+                    act_dim,
+                    timeframe=split["timeframe"],
+                    progress=eval_progress,
+                    progress_desc=f"eval {epoch} {split['symbol']} {split['timeframe']}",
+                    progress_position=progress_position,
+                )
+                if metrics is not None:
+                    metrics_list.append(metrics)
+                    weights.append(len(val_df))
+            val_metrics = aggregate_metrics(metrics_list, weights)
+            if val_metrics is not None and val_metrics.get("total_return", -float("inf")) > best_val:
                 best_val = val_metrics["total_return"]
                 ckpt = {"model_state": model.state_dict(), "model_config": ckpt_config}
                 best_path = os.path.join(
@@ -1405,6 +1475,7 @@ def train_offline(cfg, args):
                     "val_total_return": val_metrics["total_return"],
                     "val_sharpe": val_metrics["sharpe"],
                     "val_max_drawdown": val_metrics["max_drawdown"],
+                    "val_datasets": val_metrics.get("datasets", 0),
                 }
             )
 
@@ -1426,7 +1497,11 @@ def train_ppo(cfg, args):
     seed = int(cfg.get("rl", {}).get("seed", 42))
     set_seed(seed)
 
-    train_df, val_df, state_cols = prepare_splits(cfg)
+    splits, state_cols = prepare_splits(cfg)
+    if len(splits) != 1:
+        raise ValueError("PPO mode does not support multi-dataset pooling")
+    train_df = splits[0]["train"]
+    val_df = splits[0]["val"]
 
     device = select_device(cfg["train"]["device"])
     action_mode = str(cfg.get("rl", {}).get("action_mode", "discrete")).lower()

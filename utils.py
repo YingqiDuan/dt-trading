@@ -50,6 +50,29 @@ def annualization_factor(timeframe, days_per_year=365):
     return (days_per_year * 24 * 3600) / seconds_per_bar
 
 
+def resolve_data_sources(cfg):
+    data_cfg = cfg.get("data", {})
+    symbols = data_cfg.get("symbols", None)
+    timeframes = data_cfg.get("timeframes", None)
+    if symbols is None and timeframes is None:
+        return [(data_cfg["symbol"], data_cfg["timeframe"])]
+
+    def normalize(value, fallback):
+        if value is None:
+            return [fallback]
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        return [value]
+
+    symbols = normalize(symbols, data_cfg["symbol"])
+    timeframes = normalize(timeframes, data_cfg["timeframe"])
+    sources = []
+    for symbol in symbols:
+        for timeframe in timeframes:
+            sources.append((symbol, timeframe))
+    return sources
+
+
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)

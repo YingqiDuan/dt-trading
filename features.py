@@ -87,13 +87,13 @@ def resolve_state_cols(cfg):
     return state_cols
 
 
-def load_feature_cache(cfg):
+def load_feature_cache(cfg, symbol=None, timeframe=None):
     feature_dir = cfg.get("data", {}).get("feature_dir")
     if not feature_dir:
         return None, None
 
-    symbol = cfg["data"]["symbol"].replace("/", "")
-    tf = cfg["data"]["timeframe"]
+    symbol = (symbol or cfg["data"]["symbol"]).replace("/", "")
+    tf = timeframe or cfg["data"]["timeframe"]
     feature_path = os.path.join(feature_dir, f"{symbol}_{tf}_features.csv")
     if not os.path.exists(feature_path):
         return None, None

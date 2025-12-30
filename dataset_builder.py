@@ -176,11 +176,12 @@ def validate_ohlcv(df, timeframe, cfg):
     return out, report
 
 
-def load_or_fetch(cfg, force=False):
+def load_or_fetch(cfg, force=False, symbol=None, timeframe=None):
     raw_dir = cfg["data"]["raw_dir"]
     ensure_dir(raw_dir)
-    symbol = cfg["data"]["symbol"].replace("/", "")
-    tf = cfg["data"]["timeframe"]
+    raw_symbol = symbol or cfg["data"]["symbol"]
+    tf = timeframe or cfg["data"]["timeframe"]
+    symbol = raw_symbol.replace("/", "")
     path = os.path.join(raw_dir, f"{symbol}_{tf}.csv")
 
     from_cache = os.path.exists(path) and not force
@@ -189,8 +190,8 @@ def load_or_fetch(cfg, force=False):
     else:
         df = fetch_ohlcv(
             cfg["data"]["exchange"],
-            cfg["data"]["symbol"],
-            cfg["data"]["timeframe"],
+            raw_symbol,
+            tf,
             cfg["data"]["since"],
             cfg["data"]["until"],
             cfg["data"]["limit"],
@@ -232,17 +233,32 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    raw_df = load_or_fetch(cfg, force=args.force)
-    feat_df, state_cols = build_features(raw_df, cfg["features"])
-    feat_df = feat_df.dropna(subset=state_cols).reset_index(drop=True)
+    symbols = cfg.get("data", {}).get("symbols", None)
+    timeframes = cfg.get("data", {}).get("timeframes", None)
+    if symbols is None and timeframes is None:
+        sources = [(cfg["data"]["symbol"], cfg["data"]["timeframe"])]
+    else:
+        if symbols is None:
+            symbols = [cfg["data"]["symbol"]]
+        elif not isinstance(symbols, (list, tuple)):
+            symbols = [symbols]
+        if timeframes is None:
+            timeframes = [cfg["data"]["timeframe"]]
+        elif not isinstance(timeframes, (list, tuple)):
+            timeframes = [timeframes]
+        sources = [(symbol, tf) for symbol in symbols for tf in timeframes]
 
     feature_dir = cfg["data"]["feature_dir"]
     ensure_dir(feature_dir)
-    symbol = cfg["data"]["symbol"].replace("/", "")
-    tf = cfg["data"]["timeframe"]
-    feature_path = os.path.join(feature_dir, f"{symbol}_{tf}_features.csv")
-    feat_df.to_csv(feature_path, index=False)
-    print(f"saved feature CSV to {feature_path} ({len(feat_df)} rows)")
+    for raw_symbol, tf in sources:
+        raw_df = load_or_fetch(cfg, force=args.force, symbol=raw_symbol, timeframe=tf)
+        feat_df, state_cols = build_features(raw_df, cfg["features"])
+        feat_df = feat_df.dropna(subset=state_cols).reset_index(drop=True)
+
+        symbol = raw_symbol.replace("/", "")
+        feature_path = os.path.join(feature_dir, f"{symbol}_{tf}_features.csv")
+        feat_df.to_csv(feature_path, index=False)
+        print(f"saved feature CSV to {feature_path} ({len(feat_df)} rows)")
 
 
 if __name__ == "__main__":
