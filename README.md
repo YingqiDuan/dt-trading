@@ -97,6 +97,8 @@ python walk_forward.py --config config.yaml
 - `papertrade.base_url`: `https://fapi.binance.com | https://demo-fapi.binance.com`.
 - `papertrade.use_websocket`: enable kline streaming (requires `websocket-client`).
 - `papertrade.ws_base_url`: override websocket base URL if needed.
+- `papertrade.position_sizing`: dynamic sizing options (`fixed_qty`, `fixed_notional`, `equity_fraction`).
+- `papertrade.stop_loss_pct` / `papertrade.max_drawdown_pct`: stop-loss and kill-switch thresholds.
 - `walk_forward.*`: rolling window sizes in bars; outputs to `outputs/walk_forward/`.
 
 ## Environment Variables

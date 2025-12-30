@@ -152,6 +152,38 @@ class RollingOHLCVBuffer:
         self.df["datetime"] = pd.to_datetime(self.df["timestamp"], unit="ms", utc=True)
 
 
+def compute_target_qty(cfg, action, price, equity):
+    sizing_cfg = cfg.get("papertrade", {}).get("position_sizing", {})
+    mode = str(sizing_cfg.get("mode", "fixed_qty")).lower()
+    if price <= 0:
+        return 0.0
+
+    if mode == "fixed_qty":
+        base_qty = float(sizing_cfg.get("fixed_qty", cfg["papertrade"].get("trade_qty", 0.0)))
+    elif mode == "fixed_notional":
+        notional = float(sizing_cfg.get("fixed_notional", 0.0))
+        base_qty = notional / price
+    elif mode == "equity_fraction":
+        fraction = float(sizing_cfg.get("equity_fraction", 0.0))
+        base_qty = equity * fraction / price
+    else:
+        raise ValueError(f"unsupported position_sizing mode {mode}")
+
+    max_notional = sizing_cfg.get("max_position_notional", None)
+    if max_notional is not None:
+        max_qty = float(max_notional) / price
+        base_qty = min(base_qty, max_qty)
+
+    min_qty = float(sizing_cfg.get("min_qty", 0.0))
+    max_qty = sizing_cfg.get("max_qty", None)
+    if max_qty is not None:
+        base_qty = min(base_qty, float(max_qty))
+    if base_qty < min_qty:
+        base_qty = 0.0
+
+    return float(action) * base_qty
+
+
 def create_client(cfg):
     api_key = os.getenv(cfg["papertrade"]["api_key_env"], "")
     api_secret = os.getenv(cfg["papertrade"]["api_secret_env"], "")
@@ -404,32 +436,16 @@ def run_decision(cfg, model, device, log_path, client, df):
         if action_mode == "continuous":
             a = torch.tensor(actions_in, device=device).unsqueeze(0)
             logits = model(s, a, r)
-            action = float(torch.tanh(logits[0, -1]).cpu().numpy().item())
+            model_action = float(torch.tanh(logits[0, -1]).cpu().numpy().item())
         else:
             a = torch.tensor(action_to_index(actions_in), device=device).unsqueeze(0)
             logits = model(s, a, r)
             action_idx = int(torch.argmax(logits[0, -1]).item())
-            action = int(index_to_action(action_idx))
+            model_action = float(index_to_action(action_idx))
 
+    model_action = float(np.clip(model_action, -1.0, 1.0))
     features_hash = hashlib.sha256(state_window[-1].tobytes()).hexdigest()
     dry_run = cfg["papertrade"]["dry_run"]
-    trade_qty = cfg["papertrade"]["trade_qty"]
-    target_qty = action * trade_qty
-
-    prev_log = last_log
-    equity = compute_equity(
-        prev_log,
-        float(last_row["close"]),
-        float(action),
-        cfg["rewards"]["fee"],
-        cfg["rewards"]["slip"],
-        cfg["backtest"]["initial_cash"],
-    )
-
-    peak_equity = max(max_equity, equity)
-
-    max_dd = cfg["papertrade"]["max_drawdown_pct"]
-    halted = peak_equity > 0 and equity < peak_equity * (1.0 - max_dd)
 
     current_qty = 0.0
     order_resp = None
@@ -445,8 +461,56 @@ def run_decision(cfg, model, device, log_path, client, df):
         except Exception as exc:
             error = f"position_fetch_failed: {exc}"
 
-    if halted and not error:
-        error = "kill_switch_triggered"
+    prev_action = float(last_log.get("action", 0.0)) if last_log is not None else 0.0
+    prev_entry = float(last_log.get("entry_price", 0.0)) if last_log is not None else 0.0
+    prev_qty = float(last_log.get("position_qty", 0.0)) if last_log is not None else 0.0
+    prev_sign = float(np.sign(prev_qty)) if prev_qty != 0.0 else float(np.sign(prev_action))
+
+    equity_before = compute_equity(
+        last_log,
+        float(last_row["close"]),
+        float(prev_action),
+        cfg["rewards"]["fee"],
+        cfg["rewards"]["slip"],
+        cfg["backtest"]["initial_cash"],
+    )
+    peak_equity = max(max_equity, equity_before)
+    max_dd = float(cfg["papertrade"]["max_drawdown_pct"])
+    halted = peak_equity > 0 and equity_before < peak_equity * (1.0 - max_dd)
+
+    stop_loss_pct = float(cfg.get("papertrade", {}).get("stop_loss_pct", 0.0))
+    risk_reason = ""
+    final_action = model_action
+
+    if prev_sign != 0.0 and prev_entry > 0.0 and stop_loss_pct > 0.0:
+        last_close = float(last_row["close"])
+        if prev_sign > 0 and last_close <= prev_entry * (1.0 - stop_loss_pct):
+            final_action = 0.0
+            risk_reason = "stop_loss"
+        elif prev_sign < 0 and last_close >= prev_entry * (1.0 + stop_loss_pct):
+            final_action = 0.0
+            risk_reason = "stop_loss"
+
+    if halted:
+        final_action = 0.0
+        if not risk_reason:
+            risk_reason = "kill_switch"
+
+    equity = compute_equity(
+        last_log,
+        float(last_row["close"]),
+        float(final_action),
+        cfg["rewards"]["fee"],
+        cfg["rewards"]["slip"],
+        cfg["backtest"]["initial_cash"],
+    )
+
+    target_qty = compute_target_qty(
+        cfg,
+        final_action,
+        float(last_row["close"]),
+        float(equity_before),
+    )
 
     delta = target_qty - current_qty
     if not error:
@@ -461,14 +525,41 @@ def run_decision(cfg, model, device, log_path, client, df):
                 except Exception as exc:
                     error = f"order_failed: {exc}"
 
-    status = "HALTED" if halted else ("ERROR" if error else "OK")
+    entry_price = 0.0
+    if final_action != 0.0:
+        if prev_sign != 0.0 and np.sign(final_action) == prev_sign and prev_entry > 0.0:
+            entry_price = prev_entry
+        else:
+            entry_price = float(last_row["close"])
+
+    stop_price = 0.0
+    if entry_price > 0.0 and stop_loss_pct > 0.0:
+        if final_action > 0:
+            stop_price = entry_price * (1.0 - stop_loss_pct)
+        elif final_action < 0:
+            stop_price = entry_price * (1.0 + stop_loss_pct)
+
+    if error:
+        status = "ERROR"
+    elif halted:
+        status = "HALTED"
+    elif risk_reason == "stop_loss":
+        status = "STOP_LOSS"
+    else:
+        status = "OK"
+
     log_row = {
         "timestamp": last_timestamp,
         "close": float(last_row["close"]),
-        "action": action,
-        "target_position": action,
-        "position": action,
+        "model_action": float(model_action),
+        "action": float(final_action),
+        "target_position": float(final_action),
+        "position": float(final_action),
+        "target_qty": float(target_qty),
         "position_qty": float(current_qty),
+        "entry_price": float(entry_price),
+        "stop_price": float(stop_price),
+        "risk_reason": risk_reason,
         "order_side": order_side,
         "equity": equity,
         "features_hash": features_hash,

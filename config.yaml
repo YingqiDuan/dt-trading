@@ -142,6 +142,15 @@ papertrade:
   ws_closed_only: true  # only act on closed bars
   ws_reconnect_seconds: 5
   poll_seconds: 10
+  stop_loss_pct: 0.1
+  position_sizing:
+    mode: fixed_qty  # fixed_qty|fixed_notional|equity_fraction
+    fixed_qty: 0.001
+    fixed_notional: 0.0
+    equity_fraction: 0.1
+    min_qty: 0.0
+    max_qty: null
+    max_position_notional: null
   max_drawdown_pct: 0.3
   log_path: outputs/papertrade/trade_log.csv
   api_key_env: "BINANCE_API_KEY"
