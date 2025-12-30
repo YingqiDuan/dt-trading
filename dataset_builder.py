@@ -8,222 +8,175 @@ import pandas as pd
 
 from features import build_features
 from utils import ensure_dir, load_config, parse_date, to_ms
-try:
-    from tqdm import tqdm
-except Exception:
-    tqdm = None
+from tqdm import tqdm
 
 
 def fetch_ohlcv(exchange_id, symbol, timeframe, since, until, limit):
-    exchange_cls = getattr(ccxt, exchange_id)
-    exchange = exchange_cls({"enableRateLimit": True})
-    timeframe_ms = int(exchange.parse_timeframe(timeframe) * 1000)
+    """从交易所获取 OHLCV 数据"""
+    exchange = getattr(ccxt, exchange_id)({"enableRateLimit": True})
+    tf_ms = exchange.parse_timeframe(timeframe) * 1000
+    since_ms, until_ms = to_ms(parse_date(since)), to_ms(parse_date(until))
 
-    since_ms = to_ms(parse_date(since))
-    until_ms = to_ms(parse_date(until))
     all_rows = []
-    total = None
-    if timeframe_ms > 0:
-        total = max(0, (until_ms - since_ms) // timeframe_ms)
-    pbar = None
-    if tqdm is not None:
-        pbar = tqdm(
-            total=total,
-            desc=f"fetch {symbol} {timeframe}",
-            unit="bar",
-            dynamic_ncols=True,
-            leave=False,
-        )
+    pbar = tqdm(
+        total=(until_ms - since_ms) // tf_ms, desc=f"fetch {symbol}", unit="bar"
+    )
 
     while since_ms < until_ms:
-        batch = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since_ms, limit=limit)
+        batch = exchange.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=limit)
         if not batch:
             break
         all_rows.extend(batch)
-        since_ms = batch[-1][0] + timeframe_ms
-        if pbar is not None:
-            pbar.update(len(batch))
+        since_ms = batch[-1][0] + tf_ms
+        pbar.update(len(batch))
         if len(batch) < limit:
             break
         if exchange.rateLimit:
             time.sleep(exchange.rateLimit / 1000.0)
-    if pbar is not None:
-        pbar.close()
+
+    pbar.close()
 
     df = pd.DataFrame(
-        all_rows,
-        columns=["timestamp", "open", "high", "low", "close", "volume"],
+        all_rows, columns=["timestamp", "open", "high", "low", "close", "volume"]
     )
-    df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
+    df = df.drop_duplicates("timestamp").sort_values("timestamp")
     df = df[df["timestamp"] <= until_ms].reset_index(drop=True)
     df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     return df
 
 
-def timeframe_to_millis(timeframe):
-    unit = timeframe[-1]
-    amount = int(timeframe[:-1])
-    if unit == "m":
-        return amount * 60_000
-    if unit == "h":
-        return amount * 3_600_000
-    if unit == "d":
-        return amount * 86_400_000
-    if unit == "w":
-        return amount * 7 * 86_400_000
-    if unit == "M":
-        return amount * 30 * 86_400_000
-    raise ValueError(f"unsupported timeframe {timeframe}")
+def timeframe_to_millis(tf):
+    """将时间周期字符串转换为毫秒"""
+    unit, value = tf[-1], int(tf[:-1])
+    lookup = {"m": 60, "h": 3600, "d": 86400, "w": 604800, "M": 2592000}
+    if unit not in lookup:
+        raise ValueError(f"unsupported timeframe {tf}")
+    return value * lookup[unit] * 1000
 
 
 def validate_ohlcv(df, timeframe, cfg):
+    """检查数据完整性并处理缺口"""
     report = {
         "duplicate_rows": 0,
         "invalid_timestamp_rows": 0,
         "missing_bars": 0,
         "filled_bars": 0,
-        "irregular_gaps": 0,
     }
     if df is None or df.empty:
         return df, report
 
-    required = ["timestamp", "open", "high", "low", "close", "volume"]
-    missing_cols = [col for col in required if col not in df.columns]
-    if missing_cols:
-        raise ValueError(f"missing required columns: {missing_cols}")
+    # 1. 清洗时间戳
+    df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
+    invalid_count = df["timestamp"].isna().sum()
+    if invalid_count > 0:
+        df = df.dropna(subset=["timestamp"])
+        report["invalid_timestamp_rows"] = int(invalid_count)
 
-    out = df.copy()
-    out["timestamp"] = pd.to_numeric(out["timestamp"], errors="coerce")
-    invalid_ts = int(out["timestamp"].isna().sum())
-    if invalid_ts:
-        out = out.dropna(subset=["timestamp"]).copy()
-    report["invalid_timestamp_rows"] = invalid_ts
-    if out.empty:
-        return out, report
+    # 2. 去重与排序
+    orig_len = len(df)
+    df = (
+        df.astype({"timestamp": np.int64})
+        .drop_duplicates("timestamp")
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
+    report["duplicate_rows"] = orig_len - len(df)
 
-    out["timestamp"] = out["timestamp"].astype(np.int64)
-    before = len(out)
-    out = out.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-    report["duplicate_rows"] = int(before - len(out))
+    integrity = cfg.get("data", {}).get("integrity", {})
+    if not integrity.get("enabled", True) or len(df) < 2:
+        df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        return df, report
 
-    integrity_cfg = cfg.get("data", {}).get("integrity", {})
-    if not bool(integrity_cfg.get("enabled", True)):
-        out["datetime"] = pd.to_datetime(out["timestamp"], unit="ms", utc=True)
-        return out, report
+    # 3. 缺口检测
+    tf_ms = timeframe_to_millis(timeframe)
+    ts = df["timestamp"].values
+    gaps = np.diff(ts)
+    gap_indices = np.where(gaps > tf_ms)[0]
 
-    gap_policy = str(integrity_cfg.get("gap_policy", "warn")).lower()
-    if gap_policy not in ("fill", "warn", "error"):
-        raise ValueError(f"unsupported gap_policy {gap_policy}")
+    missing_counts = (gaps[gap_indices] // tf_ms) - 1
+    report["missing_bars"] = (
+        int(np.sum(missing_counts)) if len(missing_counts) > 0 else 0
+    )
 
-    timeframe_ms = timeframe_to_millis(timeframe)
-    ts = out["timestamp"].to_numpy()
-    if len(ts) < 2:
-        out["datetime"] = pd.to_datetime(out["timestamp"], unit="ms", utc=True)
-        return out, report
+    gap_policy = str(integrity.get("gap_policy", "warn")).lower()
+    if report["missing_bars"] > 0:
+        if gap_policy == "error":
+            raise ValueError(f"found {report['missing_bars']} missing bars")
 
-    diffs = np.diff(ts)
-    gap_indices = np.where(diffs > timeframe_ms)[0]
-    missing_total = 0
-    irregular = 0
-    gap_sizes = []
-    for idx in gap_indices:
-        gap = int(diffs[idx])
-        if gap % timeframe_ms != 0:
-            irregular += 1
-        missing = gap // timeframe_ms - 1
-        if missing > 0:
-            gap_sizes.append(missing)
-            missing_total += missing
+        # 4. 缺口填充 (仅当 policy=fill)
+        if gap_policy == "fill":
+            max_gap = int(integrity.get("max_gap_bars", 0))
+            new_rows = []
+            for idx, count in zip(gap_indices, missing_counts):
+                if max_gap > 0 and count > max_gap:
+                    raise ValueError(
+                        f"gap of {count} bars exceeds max_gap_bars={max_gap}"
+                    )
 
-    report["missing_bars"] = int(missing_total)
-    report["irregular_gaps"] = int(irregular)
+                # 用前一个 bar 的收盘价填充 OHLC，Vol=0
+                prev = df.iloc[idx]
+                fill_val = prev["close"]
+                base_ts = prev["timestamp"]
+                for step in range(1, int(count) + 1):
+                    row = {
+                        "timestamp": base_ts + tf_ms * step,
+                        "open": fill_val,
+                        "high": fill_val,
+                        "low": fill_val,
+                        "close": fill_val,
+                        "volume": 0.0,
+                    }
+                    new_rows.append(row)
 
-    if report["irregular_gaps"] > 0 and gap_policy in ("fill", "error"):
-        raise ValueError("found irregular timestamp gaps; check timeframe alignment")
-    if report["missing_bars"] > 0 and gap_policy == "error":
-        raise ValueError(f"found {report['missing_bars']} missing bars")
-
-    if report["missing_bars"] > 0 and gap_policy == "fill":
-        max_gap_bars = int(integrity_cfg.get("max_gap_bars", 0))
-        missing_rows = []
-        for idx in gap_indices:
-            gap = int(diffs[idx])
-            missing = gap // timeframe_ms - 1
-            if missing <= 0:
-                continue
-            if max_gap_bars > 0 and missing > max_gap_bars:
-                raise ValueError(
-                    f"gap of {missing} bars exceeds max_gap_bars={max_gap_bars}"
+            if new_rows:
+                df = (
+                    pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
+                    .sort_values("timestamp")
+                    .reset_index(drop=True)
                 )
-            prev_row = out.iloc[idx].to_dict()
-            prev_close = float(prev_row["close"])
-            for col in ("open", "high", "low", "close"):
-                if col in prev_row:
-                    prev_row[col] = prev_close
-            if "volume" in prev_row:
-                prev_row["volume"] = 0.0
-            for step in range(1, missing + 1):
-                row = prev_row.copy()
-                row["timestamp"] = int(ts[idx] + timeframe_ms * step)
-                missing_rows.append(row)
-        if missing_rows:
-            fill_df = pd.DataFrame(missing_rows)
-            out = pd.concat([out, fill_df], ignore_index=True)
-            out = out.sort_values("timestamp").reset_index(drop=True)
-            report["filled_bars"] = int(len(missing_rows))
+                report["filled_bars"] = len(new_rows)
 
-    out["datetime"] = pd.to_datetime(out["timestamp"], unit="ms", utc=True)
-    return out, report
+    df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    return df, report
 
 
 def load_or_fetch(cfg, force=False, symbol=None, timeframe=None):
+    """加载缓存或下载新数据"""
     raw_dir = cfg["data"]["raw_dir"]
     ensure_dir(raw_dir)
-    raw_symbol = symbol or cfg["data"]["symbol"]
-    tf = timeframe or cfg["data"]["timeframe"]
-    symbol = raw_symbol.replace("/", "")
-    path = os.path.join(raw_dir, f"{symbol}_{tf}.csv")
+    sym, tf = symbol or cfg["data"]["symbol"], timeframe or cfg["data"]["timeframe"]
+    path = os.path.join(raw_dir, f"{sym.replace('/', '')}_{tf}.csv")
 
-    from_cache = os.path.exists(path) and not force
-    if from_cache:
+    if os.path.exists(path) and not force:
         df = pd.read_csv(path)
+        from_cache = True
     else:
         df = fetch_ohlcv(
             cfg["data"]["exchange"],
-            raw_symbol,
+            sym,
             tf,
             cfg["data"]["since"],
             cfg["data"]["until"],
             cfg["data"]["limit"],
         )
+        from_cache = False
 
-    df, report = validate_ohlcv(df, tf, cfg)
+    df, r = validate_ohlcv(df, tf, cfg)
+
+    # 如果数据有变动（清洗过或新下载），则保存
     changed = any(
-        report[key] > 0
-        for key in ("duplicate_rows", "invalid_timestamp_rows", "filled_bars")
+        r[k] > 0 for k in ["duplicate_rows", "invalid_timestamp_rows", "filled_bars"]
     )
     if not from_cache or changed:
         df.to_csv(path, index=False)
         if from_cache and changed:
             print(f"saved cleaned OHLCV to {path}")
-    if report["missing_bars"] > 0:
+
+    if r["missing_bars"]:
         print(
-            f"data integrity: missing_bars={report['missing_bars']} filled_bars={report['filled_bars']} "
-            f"gap_policy={cfg.get('data', {}).get('integrity', {}).get('gap_policy', 'warn')}"
-        )
-    if report["duplicate_rows"] > 0 or report["invalid_timestamp_rows"] > 0:
-        print(
-            f"data integrity: duplicate_rows={report['duplicate_rows']} "
-            f"invalid_timestamp_rows={report['invalid_timestamp_rows']}"
+            f"Integrity [{sym} {tf}]: missing={r['missing_bars']} filled={r['filled_bars']} policy={cfg.get('data',{}).get('integrity',{}).get('gap_policy')}"
         )
     return df
-
-
-def split_by_time(df, train_end, val_end, test_end):
-    train = df[df["datetime"] <= train_end].copy()
-    val = df[(df["datetime"] > train_end) & (df["datetime"] <= val_end)].copy()
-    test = df[(df["datetime"] > val_end) & (df["datetime"] <= test_end)].copy()
-    return train, val, test
 
 
 def main():
@@ -231,34 +184,33 @@ def main():
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
-
     cfg = load_config(args.config)
-    symbols = cfg.get("data", {}).get("symbols", None)
-    timeframes = cfg.get("data", {}).get("timeframes", None)
-    if symbols is None and timeframes is None:
-        sources = [(cfg["data"]["symbol"], cfg["data"]["timeframe"])]
-    else:
-        if symbols is None:
-            symbols = [cfg["data"]["symbol"]]
-        elif not isinstance(symbols, (list, tuple)):
-            symbols = [symbols]
-        if timeframes is None:
-            timeframes = [cfg["data"]["timeframe"]]
-        elif not isinstance(timeframes, (list, tuple)):
-            timeframes = [timeframes]
-        sources = [(symbol, tf) for symbol in symbols for tf in timeframes]
 
-    feature_dir = cfg["data"]["feature_dir"]
-    ensure_dir(feature_dir)
-    for raw_symbol, tf in sources:
-        raw_df = load_or_fetch(cfg, force=args.force, symbol=raw_symbol, timeframe=tf)
-        feat_df, state_cols = build_features(raw_df, cfg["features"])
-        feat_df = feat_df.dropna(subset=state_cols).reset_index(drop=True)
+    # 标准化 symbols 和 timeframes 为列表
+    def to_list(x):
+        return x if isinstance(x, (list, tuple)) else [x]
 
-        symbol = raw_symbol.replace("/", "")
-        feature_path = os.path.join(feature_dir, f"{symbol}_{tf}_features.csv")
-        feat_df.to_csv(feature_path, index=False)
-        print(f"saved feature CSV to {feature_path} ({len(feat_df)} rows)")
+    symbols = to_list(cfg.get("data", {}).get("symbols") or cfg["data"]["symbol"])
+    timeframes = to_list(
+        cfg.get("data", {}).get("timeframes") or cfg["data"]["timeframe"]
+    )
+
+    feat_dir = cfg["data"]["feature_dir"]
+    ensure_dir(feat_dir)
+
+    for sym in symbols:
+        for tf in timeframes:
+            raw_df = load_or_fetch(cfg, force=args.force, symbol=sym, timeframe=tf)
+            feat_df, cols = build_features(raw_df, cfg["features"])
+
+            # 删除因指标计算产生的 NaN 行 (如 MA 的前 N 行)
+            feat_df = feat_df.dropna(subset=cols).reset_index(drop=True)
+
+            out_path = os.path.join(
+                feat_dir, f"{sym.replace('/', '')}_{tf}_features.csv"
+            )
+            feat_df.to_csv(out_path, index=False)
+            print(f"saved features to {out_path} ({len(feat_df)} rows)")
 
 
 if __name__ == "__main__":

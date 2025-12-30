@@ -4,6 +4,7 @@ import random
 from datetime import datetime, timezone
 
 import numpy as np
+import pandas as pd
 import yaml
 
 
@@ -95,3 +96,10 @@ def rolling_zscore(series, window):
 def save_json(path, payload):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
+
+
+def split_by_time(df, train_end, val_end, test_end):
+    train = df[df["datetime"] <= train_end].copy()
+    val = df[(df["datetime"] > train_end) & (df["datetime"] <= val_end)].copy()
+    test = df[(df["datetime"] > val_end) & (df["datetime"] <= test_end)].copy()
+    return train, val, test

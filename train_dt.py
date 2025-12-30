@@ -8,13 +8,14 @@ import torch
 import torch.nn.functional as F
 from torch.distributions import Categorical, Normal
 from torch.utils.data import DataLoader, Dataset
+
 try:
     from tqdm import tqdm
 except Exception:
     tqdm = None
 
 from backtest import compute_metrics, simulate
-from dataset_builder import load_or_fetch, split_by_time
+from dataset_builder import load_or_fetch
 from dt_model import DecisionTransformer
 from dt_utils import (
     compute_rtg,
@@ -39,6 +40,7 @@ from utils import (
     resolve_data_sources,
     save_json,
     set_seed,
+    split_by_time,
 )
 
 
@@ -84,7 +86,9 @@ def infer_metric_mode(metric_name):
     return "max"
 
 
-def get_metric_value(metric_name, train_loss=None, val_metrics=None, extra_metrics=None):
+def get_metric_value(
+    metric_name, train_loss=None, val_metrics=None, extra_metrics=None
+):
     if not metric_name:
         return None
     name = str(metric_name)
@@ -206,7 +210,9 @@ def aggregate_metrics(metrics_list, weights=None):
     keys = set()
     for metrics in metrics_list:
         for key, value in metrics.items():
-            if isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(value):
+            if isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(
+                value
+            ):
                 keys.add(key)
 
     summary = {}
@@ -215,7 +221,9 @@ def aggregate_metrics(metrics_list, weights=None):
         wts = []
         for metrics, weight in zip(metrics_list, weights):
             value = metrics.get(key)
-            if isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(value):
+            if isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(
+                value
+            ):
                 vals.append(float(value))
                 wts.append(float(weight))
         if wts:
@@ -248,7 +256,9 @@ BEHAVIOR_POLICIES = (
 
 def build_behavior_actions(df, cfg, action_mode, rng, policy_override=None):
     dataset_cfg = cfg.get("dataset", {})
-    policy = str(policy_override or dataset_cfg.get("behavior_policy", "ema3_6_cross")).lower()
+    policy = str(
+        policy_override or dataset_cfg.get("behavior_policy", "ema3_6_cross")
+    ).lower()
     stop_loss = float(dataset_cfg.get("behavior_stop_loss", 0.1))
 
     close = df["close"].to_numpy(dtype=np.float64)
@@ -487,10 +497,14 @@ def build_trajectories(df, state_cols, cfg, action_mode, act_dim, rng):
             for name, weight in mix_cfg.items():
                 policy_name = str(name).lower()
                 if policy_name not in BEHAVIOR_POLICIES:
-                    raise ValueError(f"unsupported behavior policy in mix: {policy_name}")
+                    raise ValueError(
+                        f"unsupported behavior policy in mix: {policy_name}"
+                    )
                 weight_val = float(weight)
                 if weight_val <= 0:
-                    raise ValueError(f"behavior_mix weight must be > 0 for {policy_name}")
+                    raise ValueError(
+                        f"behavior_mix weight must be > 0 for {policy_name}"
+                    )
                 policies.append(policy_name)
                 weights.append(weight_val)
             weights = np.asarray(weights, dtype=np.float64)
@@ -507,15 +521,23 @@ def build_trajectories(df, state_cols, cfg, action_mode, act_dim, rng):
 
         weights = weights / weights.sum()
         actions_by_policy = {
-            name: build_behavior_actions(df, cfg, action_mode, rng, policy_override=name)
+            name: build_behavior_actions(
+                df, cfg, action_mode, rng, policy_override=name
+            )
             for name in policies
         }
     else:
-        actions = build_behavior_actions(df, cfg, action_mode, rng, policy_override=policy)
+        actions = build_behavior_actions(
+            df, cfg, action_mode, rng, policy_override=policy
+        )
     states = df[state_cols].to_numpy(dtype=np.float32)
     close = df["close"].to_numpy(dtype=np.float32)
-    open_prices = df["open"].to_numpy(dtype=np.float32) if "open" in df.columns else None
-    high_prices = df["high"].to_numpy(dtype=np.float32) if "high" in df.columns else None
+    open_prices = (
+        df["open"].to_numpy(dtype=np.float32) if "open" in df.columns else None
+    )
+    high_prices = (
+        df["high"].to_numpy(dtype=np.float32) if "high" in df.columns else None
+    )
     low_prices = df["low"].to_numpy(dtype=np.float32) if "low" in df.columns else None
 
     trajectories = []
@@ -708,8 +730,12 @@ def evaluate_policy(
 
     states = df[state_cols].to_numpy(dtype=np.float32)
     close = df["close"].to_numpy(dtype=np.float32)
-    open_prices = df["open"].to_numpy(dtype=np.float32) if "open" in df.columns else None
-    high_prices = df["high"].to_numpy(dtype=np.float32) if "high" in df.columns else None
+    open_prices = (
+        df["open"].to_numpy(dtype=np.float32) if "open" in df.columns else None
+    )
+    high_prices = (
+        df["high"].to_numpy(dtype=np.float32) if "high" in df.columns else None
+    )
     low_prices = df["low"].to_numpy(dtype=np.float32) if "low" in df.columns else None
     timestamps = df["timestamp"].to_numpy(dtype=np.int64)
 
@@ -759,7 +785,9 @@ def evaluate_policy(
                     window_prev = actions[idx - seq_len] if idx - seq_len >= 0 else 0
                     actions_in[0] = int(window_prev)
                     actions_in[1:] = actions[idx - seq_len + 1 : idx]
-                    a = torch.tensor(action_to_index(actions_in), device=device).unsqueeze(0)
+                    a = torch.tensor(
+                        action_to_index(actions_in), device=device
+                    ).unsqueeze(0)
 
                 with torch.no_grad():
                     s = torch.tensor(state_window, device=device).unsqueeze(0)
@@ -772,7 +800,9 @@ def evaluate_policy(
                             sample = mean + rng.normal(scale=std, size=mean.shape)
                             action = float(np.tanh(sample).squeeze())
                         else:
-                            action = float(torch.tanh(logits[0, -1]).cpu().numpy().item())
+                            action = float(
+                                torch.tanh(logits[0, -1]).cpu().numpy().item()
+                            )
                     else:
                         if eval_mode == "sample":
                             probs = torch.softmax(logits[0, -1], dim=-1).cpu().numpy()
@@ -800,9 +830,15 @@ def evaluate_policy(
                     open_t=float(open_prices[idx]) if open_prices is not None else None,
                     high_t=float(high_prices[idx]) if high_prices is not None else None,
                     low_t=float(low_prices[idx]) if low_prices is not None else None,
-                    open_t1=float(open_prices[idx + 1]) if open_prices is not None else None,
-                    high_t1=float(high_prices[idx + 1]) if high_prices is not None else None,
-                    low_t1=float(low_prices[idx + 1]) if low_prices is not None else None,
+                    open_t1=(
+                        float(open_prices[idx + 1]) if open_prices is not None else None
+                    ),
+                    high_t1=(
+                        float(high_prices[idx + 1]) if high_prices is not None else None
+                    ),
+                    low_t1=(
+                        float(low_prices[idx + 1]) if low_prices is not None else None
+                    ),
                     range_penalty=range_penalty,
                 )
                 current_rtg = update_rtg(current_rtg, reward, gamma)
@@ -877,7 +913,9 @@ def evaluate_policy(
     return metrics
 
 
-def build_context(states_hist, actions_hist, rewards_hist, seq_len, action_mode, act_dim):
+def build_context(
+    states_hist, actions_hist, rewards_hist, seq_len, action_mode, act_dim
+):
     start = max(0, len(states_hist) - seq_len)
     actual_len = len(states_hist) - start
 
@@ -928,9 +966,16 @@ def policy_step(model, state_ctx, action_ctx, reward_ctx, device, action_mode):
             action = torch.tanh(z)
             log_prob = normal.log_prob(z) - torch.log(1.0 - action.pow(2) + 1e-6)
             log_prob = log_prob.sum(-1)
-            return float(action.squeeze(0).item()), None, float(log_prob.item()), float(values.item())
+            return (
+                float(action.squeeze(0).item()),
+                None,
+                float(log_prob.item()),
+                float(values.item()),
+            )
 
-        actions_in = torch.tensor(action_to_index(action_ctx), device=device).unsqueeze(0)
+        actions_in = torch.tensor(action_to_index(action_ctx), device=device).unsqueeze(
+            0
+        )
         logits, values = model(states, actions_in, rewards, return_values=True)
         logits = logits[:, -1]
         values = values[:, -1]
@@ -938,7 +983,12 @@ def policy_step(model, state_ctx, action_ctx, reward_ctx, device, action_mode):
         action_idx = dist.sample()
         log_prob = dist.log_prob(action_idx)
         action_val = int(index_to_action(action_idx.item()))
-        return action_val, int(action_idx.item()), float(log_prob.item()), float(values.item())
+        return (
+            action_val,
+            int(action_idx.item()),
+            float(log_prob.item()),
+            float(values.item()),
+        )
 
 
 def predict_value(model, state_ctx, action_ctx, reward_ctx, device, action_mode):
@@ -948,7 +998,9 @@ def predict_value(model, state_ctx, action_ctx, reward_ctx, device, action_mode)
         if action_mode == "continuous":
             actions_in = torch.tensor(action_ctx, device=device).unsqueeze(0)
         else:
-            actions_in = torch.tensor(action_to_index(action_ctx), device=device).unsqueeze(0)
+            actions_in = torch.tensor(
+                action_to_index(action_ctx), device=device
+            ).unsqueeze(0)
         _, values = model(states, actions_in, rewards, return_values=True)
         return float(values[0, -1].item())
 
@@ -1051,7 +1103,9 @@ def collect_rollout(
         state_ctx, action_ctx, reward_ctx = build_context(
             states_hist, actions_hist, rewards_hist, seq_len, action_mode, act_dim
         )
-        last_value = predict_value(model, state_ctx, action_ctx, reward_ctx, device, action_mode)
+        last_value = predict_value(
+            model, state_ctx, action_ctx, reward_ctx, device, action_mode
+        )
 
     adv, ret = compute_gae(
         np.asarray(rewards, dtype=np.float32),
@@ -1155,7 +1209,9 @@ def ppo_update(
                 normal = Normal(mean, std)
                 clipped_actions = torch.clamp(actions[idx], -0.999, 0.999)
                 z = atanh(clipped_actions)
-                new_log_prob = normal.log_prob(z) - torch.log(1.0 - clipped_actions.pow(2) + 1e-6)
+                new_log_prob = normal.log_prob(z) - torch.log(
+                    1.0 - clipped_actions.pow(2) + 1e-6
+                )
                 new_log_prob = new_log_prob.sum(-1)
                 entropy = normal.entropy().sum(-1)
             else:
@@ -1166,7 +1222,9 @@ def ppo_update(
             log_ratio = new_log_prob - old_log_probs[idx]
             ratio = torch.exp(log_ratio)
             surr1 = ratio * advantages[idx]
-            surr2 = torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range) * advantages[idx]
+            surr2 = (
+                torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range) * advantages[idx]
+            )
             policy_loss = -torch.min(surr1, surr2).mean()
             value_loss = 0.5 * (returns[idx] - values).pow(2).mean()
             entropy_loss = -entropy_coef * entropy.mean()
@@ -1238,8 +1296,12 @@ def evaluate_policy_ppo(
 
     states = df[state_cols].to_numpy(dtype=np.float32)
     close = df["close"].to_numpy(dtype=np.float32)
-    open_prices = df["open"].to_numpy(dtype=np.float32) if "open" in df.columns else None
-    high_prices = df["high"].to_numpy(dtype=np.float32) if "high" in df.columns else None
+    open_prices = (
+        df["open"].to_numpy(dtype=np.float32) if "open" in df.columns else None
+    )
+    high_prices = (
+        df["high"].to_numpy(dtype=np.float32) if "high" in df.columns else None
+    )
     low_prices = df["low"].to_numpy(dtype=np.float32) if "low" in df.columns else None
     timestamps = df["timestamp"].to_numpy(dtype=np.int64)
 
@@ -1286,7 +1348,9 @@ def evaluate_policy_ppo(
                     window_prev = actions[idx - seq_len] if idx - seq_len >= 0 else 0
                     actions_in[0] = int(window_prev)
                     actions_in[1:] = action_window[:-1]
-                    a = torch.tensor(action_to_index(actions_in), device=device).unsqueeze(0)
+                    a = torch.tensor(
+                        action_to_index(actions_in), device=device
+                    ).unsqueeze(0)
 
                 with torch.no_grad():
                     s = torch.tensor(state_window, device=device).unsqueeze(0)
@@ -1299,7 +1363,9 @@ def evaluate_policy_ppo(
                             sample = mean + rng.normal(scale=std, size=mean.shape)
                             action = float(np.tanh(sample).squeeze())
                         else:
-                            action = float(torch.tanh(logits[0, -1]).cpu().numpy().item())
+                            action = float(
+                                torch.tanh(logits[0, -1]).cpu().numpy().item()
+                            )
                     else:
                         if eval_mode == "sample":
                             probs = torch.softmax(logits[0, -1], dim=-1).cpu().numpy()
@@ -1325,9 +1391,15 @@ def evaluate_policy_ppo(
                     open_t=float(open_prices[idx]) if open_prices is not None else None,
                     high_t=float(high_prices[idx]) if high_prices is not None else None,
                     low_t=float(low_prices[idx]) if low_prices is not None else None,
-                    open_t1=float(open_prices[idx + 1]) if open_prices is not None else None,
-                    high_t1=float(high_prices[idx + 1]) if high_prices is not None else None,
-                    low_t1=float(low_prices[idx + 1]) if low_prices is not None else None,
+                    open_t1=(
+                        float(open_prices[idx + 1]) if open_prices is not None else None
+                    ),
+                    high_t1=(
+                        float(high_prices[idx + 1]) if high_prices is not None else None
+                    ),
+                    low_t1=(
+                        float(low_prices[idx + 1]) if low_prices is not None else None
+                    ),
                     range_penalty=range_penalty,
                 )
                 rewards_hist[idx + 1] = reward
@@ -1413,7 +1485,9 @@ def prepare_splits(cfg):
     test_end = parse_date(cfg["data"]["test_end"])
 
     for symbol, timeframe in sources:
-        feat_df, local_state_cols = load_feature_cache(cfg, symbol=symbol, timeframe=timeframe)
+        feat_df, local_state_cols = load_feature_cache(
+            cfg, symbol=symbol, timeframe=timeframe
+        )
         if feat_df is None:
             raw_df = load_or_fetch(cfg, symbol=symbol, timeframe=timeframe)
             feat_df, local_state_cols = build_features(raw_df, cfg["features"])
@@ -1448,7 +1522,11 @@ def train_offline(cfg, args):
 
     device = select_device(cfg["train"]["device"])
     action_mode = str(cfg.get("rl", {}).get("action_mode", "discrete")).lower()
-    act_dim = int(cfg.get("rl", {}).get("action_dim", 1)) if action_mode == "continuous" else 3
+    act_dim = (
+        int(cfg.get("rl", {}).get("action_dim", 1))
+        if action_mode == "continuous"
+        else 3
+    )
     if action_mode == "continuous" and act_dim != 1:
         raise ValueError("continuous action_mode currently supports action_dim=1")
 
@@ -1484,7 +1562,9 @@ def train_offline(cfg, args):
                 split["train"], state_cols, cfg, action_mode, act_dim, rng
             )
         )
-    dataset = TrajectoryDataset(trajectories, cfg["dataset"]["seq_len"], action_mode, act_dim)
+    dataset = TrajectoryDataset(
+        trajectories, cfg["dataset"]["seq_len"], action_mode, act_dim
+    )
     if len(dataset) == 0:
         raise ValueError("no training windows available; check seq_len/episode_len")
 
@@ -1509,10 +1589,14 @@ def train_offline(cfg, args):
         save_run_config(config_path, cfg, args, run_meta)
 
     eval_every = int(cfg.get("rl", {}).get("eval_every", 1))
-    has_val = any(split["val"] is not None and not split["val"].empty for split in splits)
+    has_val = any(
+        split["val"] is not None and not split["val"].empty for split in splits
+    )
 
     epochs = int(cfg["train"]["epochs"])
-    train_progress = bool(train_cfg.get("train_progress", train_cfg.get("update_progress", False)))
+    train_progress = bool(
+        train_cfg.get("train_progress", train_cfg.get("update_progress", False))
+    )
     eval_progress = bool(train_cfg.get("eval_progress", False))
     epoch_iter = range(1, epochs + 1)
     progress_position = 0
@@ -1529,13 +1613,17 @@ def train_offline(cfg, args):
         "action_mode": action_mode,
         "use_value_head": False,
         "condition_mode": "rtg",
-        "rtg_gamma": float(dataset_cfg.get("rtg_gamma", cfg.get("rl", {}).get("gamma", 1.0))),
+        "rtg_gamma": float(
+            dataset_cfg.get("rtg_gamma", cfg.get("rl", {}).get("gamma", 1.0))
+        ),
         "rtg_scale": float(dataset_cfg.get("rtg_scale", 1.0)),
         "target_return": float(dataset_cfg.get("target_return", 0.0)),
     }
 
     default_metric = "val_total_return" if has_val else "train_loss"
-    scheduler, scheduler_info = init_lr_scheduler(optimizer, cfg, default_metric=default_metric)
+    scheduler, scheduler_info = init_lr_scheduler(
+        optimizer, cfg, default_metric=default_metric
+    )
     early_stop = init_early_stopping(cfg, default_metric=default_metric)
 
     for epoch in epoch_iter:
@@ -1577,7 +1665,10 @@ def train_offline(cfg, args):
                     metrics_list.append(metrics)
                     weights.append(len(val_df))
             val_metrics = aggregate_metrics(metrics_list, weights)
-            if val_metrics is not None and val_metrics.get("total_return", -float("inf")) > best_val:
+            if (
+                val_metrics is not None
+                and val_metrics.get("total_return", -float("inf")) > best_val
+            ):
                 best_val = val_metrics["total_return"]
                 ckpt = {"model_state": model.state_dict(), "model_config": ckpt_config}
                 best_path = os.path.join(
@@ -1657,7 +1748,11 @@ def train_ppo(cfg, args):
 
     device = select_device(cfg["train"]["device"])
     action_mode = str(cfg.get("rl", {}).get("action_mode", "discrete")).lower()
-    act_dim = int(cfg.get("rl", {}).get("action_dim", 1)) if action_mode == "continuous" else 3
+    act_dim = (
+        int(cfg.get("rl", {}).get("action_dim", 1))
+        if action_mode == "continuous"
+        else 3
+    )
     if action_mode == "continuous" and act_dim != 1:
         raise ValueError("continuous action_mode currently supports action_dim=1")
 
@@ -1685,7 +1780,9 @@ def train_ppo(cfg, args):
         weight_decay=cfg["train"]["weight_decay"],
     )
 
-    episode_len = cfg.get("rl", {}).get("episode_len", cfg.get("dataset", {}).get("episode_len", None))
+    episode_len = cfg.get("rl", {}).get(
+        "episode_len", cfg.get("dataset", {}).get("episode_len", None)
+    )
     if episode_len is not None:
         episode_len = int(episode_len)
         if episode_len >= len(train_df):
@@ -1706,15 +1803,21 @@ def train_ppo(cfg, args):
         drawdown_penalty=cfg["rl"].get("drawdown_penalty", 0.0),
         action_mode=action_mode,
         rng=np.random.RandomState(seed),
-        open_prices=train_df["open"].to_numpy(dtype=np.float32)
-        if "open" in train_df.columns
-        else None,
-        high_prices=train_df["high"].to_numpy(dtype=np.float32)
-        if "high" in train_df.columns
-        else None,
-        low_prices=train_df["low"].to_numpy(dtype=np.float32)
-        if "low" in train_df.columns
-        else None,
+        open_prices=(
+            train_df["open"].to_numpy(dtype=np.float32)
+            if "open" in train_df.columns
+            else None
+        ),
+        high_prices=(
+            train_df["high"].to_numpy(dtype=np.float32)
+            if "high" in train_df.columns
+            else None
+        ),
+        low_prices=(
+            train_df["low"].to_numpy(dtype=np.float32)
+            if "low" in train_df.columns
+            else None
+        ),
         price_mode=cfg.get("rewards", {}).get("price_mode", "close"),
         range_penalty=cfg.get("rewards", {}).get("range_penalty", 0.0),
     )
@@ -1762,7 +1865,9 @@ def train_ppo(cfg, args):
     }
 
     default_metric = "val_total_return" if has_val else "mean_episode_return"
-    scheduler, scheduler_info = init_lr_scheduler(optimizer, cfg, default_metric=default_metric)
+    scheduler, scheduler_info = init_lr_scheduler(
+        optimizer, cfg, default_metric=default_metric
+    )
     early_stop = init_early_stopping(cfg, default_metric=default_metric)
 
     for epoch in epoch_iter:
@@ -1793,8 +1898,12 @@ def train_ppo(cfg, args):
             progress_position=progress_position,
         )
 
-        mean_ep_return = float(np.mean(buffer["ep_returns"])) if buffer["ep_returns"] else 0.0
-        mean_ep_len = float(np.mean(buffer["ep_lengths"])) if buffer["ep_lengths"] else 0.0
+        mean_ep_return = (
+            float(np.mean(buffer["ep_returns"])) if buffer["ep_returns"] else 0.0
+        )
+        mean_ep_len = (
+            float(np.mean(buffer["ep_lengths"])) if buffer["ep_lengths"] else 0.0
+        )
 
         val_metrics = None
         if has_val and eval_every > 0 and epoch % eval_every == 0:
