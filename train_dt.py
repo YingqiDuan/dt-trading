@@ -688,9 +688,6 @@ def evaluate_policy(
     was_training = model.training
     model.eval()
 
-    was_training = model.training
-    model.eval()
-
     seq_len = cfg["dataset"]["seq_len"]
     fee = float(cfg["rewards"]["fee"])
     slip = float(cfg["rewards"]["slip"])
@@ -700,6 +697,7 @@ def evaluate_policy(
     drawdown_penalty = float(cfg.get("rl", {}).get("drawdown_penalty", 0.0))
     price_mode = cfg["rewards"].get("price_mode", "close")
     range_penalty = float(cfg["rewards"].get("range_penalty", 0.0))
+    risk_free = float(cfg.get("backtest", {}).get("risk_free", 0.0))
 
     dataset_cfg = cfg.get("dataset", {})
     target_return = float(dataset_cfg.get("target_return", 0.0))
@@ -1223,6 +1221,9 @@ def evaluate_policy_ppo(
 ):
     if df is None or df.empty:
         return None
+
+    was_training = model.training
+    model.eval()
 
     seq_len = cfg["dataset"]["seq_len"]
     fee = float(cfg["rewards"]["fee"])
