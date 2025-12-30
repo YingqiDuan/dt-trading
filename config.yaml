@@ -177,3 +177,7 @@ walk_forward:
   step_bars: 720
   max_folds: 0  # 0 = all possible
   output_dir: outputs/walk_forward
+
+pipeline:
+  registry_path: outputs/models/registry.jsonl
+  deploy_dir: outputs/deploy

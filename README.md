@@ -115,3 +115,21 @@ export BINANCE_API_SECRET=...
 
 - Start with `papertrade.dry_run: true`.
 - Check `outputs/papertrade/trade_log.csv` for errors and position changes.
+
+## Pipeline
+
+Run end-to-end automation (data -> train -> backtest -> register -> deploy):
+
+```bash
+python scripts/pipeline.py --config config.yaml
+```
+
+Common options:
+
+```bash
+# skip data fetch or training
+python scripts/pipeline.py --config config.yaml --skip-data --skip-train
+
+# force rebuild data
+python scripts/pipeline.py --config config.yaml --force-data
+```
