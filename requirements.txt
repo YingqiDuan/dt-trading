@@ -5,3 +5,4 @@ pyyaml
 torch
 tqdm
 requests
+websocket-client

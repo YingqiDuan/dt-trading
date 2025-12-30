@@ -95,6 +95,8 @@ python walk_forward.py --config config.yaml
 - `rewards.price_mode`, `rewards.range_penalty`: bar pricing and volatility penalty for reward calculation.
 - `train.mode` or `--mode`: `offline | ppo`.
 - `papertrade.base_url`: `https://fapi.binance.com | https://demo-fapi.binance.com`.
+- `papertrade.use_websocket`: enable kline streaming (requires `websocket-client`).
+- `papertrade.ws_base_url`: override websocket base URL if needed.
 - `walk_forward.*`: rolling window sizes in bars; outputs to `outputs/walk_forward/`.
 
 ## Environment Variables

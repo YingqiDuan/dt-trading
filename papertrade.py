@@ -10,6 +10,10 @@ import numpy as np
 import pandas as pd
 import requests
 import torch
+try:
+    import websocket
+except Exception:
+    websocket = None
 
 from dt_model import DecisionTransformer
 from dt_utils import compute_step_reward, update_rtg
@@ -54,6 +58,104 @@ def interval_to_millis(interval):
     if unit == "d":
         return amount * 86_400_000
     raise ValueError(f"unsupported interval {interval}")
+
+
+def compute_lookback(cfg):
+    seq_len = int(cfg["dataset"]["seq_len"])
+    ema_windows = [int(w) for w in cfg["features"].get("ema_windows", [])]
+    ema_max = max(ema_windows) if ema_windows else 0
+    boll_window = int(cfg["features"].get("boll_window", 0))
+    macd_fast = int(cfg["features"].get("macd_fast", 0))
+    macd_slow = int(cfg["features"].get("macd_slow", 0))
+    macd_signal = int(cfg["features"].get("macd_signal", 0))
+    max_window = max(
+        cfg["features"]["volatility_window"],
+        cfg["features"]["rsi_window"],
+        cfg["features"]["volume_z_window"],
+        cfg["features"]["zscore_window"],
+        ema_max,
+        boll_window,
+        macd_fast,
+        macd_slow,
+        macd_signal,
+    )
+    return seq_len + max_window + cfg["features"]["zscore_window"] + 5
+
+
+def get_ws_base_url(cfg):
+    override = cfg.get("papertrade", {}).get("ws_base_url", None)
+    if override:
+        return str(override).rstrip("/")
+    base_url = str(cfg["papertrade"]["base_url"]).lower()
+    if "demo-fapi" in base_url or "testnet" in base_url:
+        return "wss://stream.binancefuture.com"
+    return "wss://fstream.binance.com"
+
+
+def build_ws_url(base_url, stream):
+    base_url = base_url.rstrip("/")
+    if base_url.endswith("/ws"):
+        return f"{base_url}/{stream}"
+    return f"{base_url}/ws/{stream}"
+
+
+def parse_kline_message(message):
+    try:
+        data = json.loads(message)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if data.get("e") != "kline":
+        return None
+    kline = data.get("k", {})
+    try:
+        bar = {
+            "timestamp": int(kline["t"]),
+            "open": float(kline["o"]),
+            "high": float(kline["h"]),
+            "low": float(kline["l"]),
+            "close": float(kline["c"]),
+            "volume": float(kline["v"]),
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+    return {"bar": bar, "closed": bool(kline.get("x", False))}
+
+
+class RollingOHLCVBuffer:
+    def __init__(self, df, max_len):
+        self.max_len = int(max_len) if max_len is not None else 0
+        self.df = df.copy()
+        if not self.df.empty:
+            self.df = (
+                self.df.drop_duplicates(subset=["timestamp"])
+                .sort_values("timestamp")
+                .reset_index(drop=True)
+            )
+            if self.max_len and len(self.df) > self.max_len:
+                self.df = self.df.tail(self.max_len).reset_index(drop=True)
+
+    def update(self, bar):
+        ts = int(bar["timestamp"])
+        if self.df.empty:
+            self.df = pd.DataFrame([bar])
+        else:
+            match = self.df.index[self.df["timestamp"] == ts]
+            if len(match) > 0:
+                idx = match[-1]
+                for col, val in bar.items():
+                    self.df.at[idx, col] = val
+            else:
+                self.df = pd.concat([self.df, pd.DataFrame([bar])], ignore_index=True)
+        self.df = self.df.sort_values("timestamp").reset_index(drop=True)
+        if self.max_len and len(self.df) > self.max_len:
+            self.df = self.df.tail(self.max_len).reset_index(drop=True)
+        self.df["datetime"] = pd.to_datetime(self.df["timestamp"], unit="ms", utc=True)
+
+
+def create_client(cfg):
+    api_key = os.getenv(cfg["papertrade"]["api_key_env"], "")
+    api_secret = os.getenv(cfg["papertrade"]["api_secret_env"], "")
+    return BinanceFuturesClient(cfg["papertrade"]["base_url"], api_key, api_secret)
 
 
 class BinanceFuturesClient:
@@ -159,10 +261,7 @@ def append_log(path, row):
     df.to_csv(path, mode="a", header=not os.path.exists(path), index=False)
 
 
-def run_cycle(cfg, model, device, log_path):
-    api_key = os.getenv(cfg["papertrade"]["api_key_env"], "")
-    api_secret = os.getenv(cfg["papertrade"]["api_secret_env"], "")
-    client = BinanceFuturesClient(cfg["papertrade"]["base_url"], api_key, api_secret)
+def run_decision(cfg, model, device, log_path, client, df):
     action_mode = getattr(model, "action_mode", "discrete")
     reward_fee = float(cfg["rewards"]["fee"])
     reward_slip = float(cfg["rewards"]["slip"])
@@ -181,27 +280,6 @@ def run_cycle(cfg, model, device, log_path):
     gamma = float(dataset_cfg.get("rtg_gamma", cfg.get("rl", {}).get("gamma", 1.0)))
 
     seq_len = cfg["dataset"]["seq_len"]
-    ema_windows = [int(w) for w in cfg["features"].get("ema_windows", [])]
-    ema_max = max(ema_windows) if ema_windows else 0
-    boll_window = int(cfg["features"].get("boll_window", 0))
-    macd_fast = int(cfg["features"].get("macd_fast", 0))
-    macd_slow = int(cfg["features"].get("macd_slow", 0))
-    macd_signal = int(cfg["features"].get("macd_signal", 0))
-    max_window = max(
-        cfg["features"]["volatility_window"],
-        cfg["features"]["rsi_window"],
-        cfg["features"]["volume_z_window"],
-        cfg["features"]["zscore_window"],
-        ema_max,
-        boll_window,
-        macd_fast,
-        macd_slow,
-        macd_signal,
-    )
-    # Extra history is needed because some features apply a rolling window and then a rolling z-score.
-    lookback = seq_len + max_window + cfg["features"]["zscore_window"] + 5
-
-    df = client.get_klines(cfg["papertrade"]["symbol"], cfg["papertrade"]["interval"], lookback)
     feat_df, state_cols = build_features(df, cfg["features"])
     feat_df = feat_df.dropna(subset=state_cols).reset_index(drop=True)
 
@@ -409,6 +487,69 @@ def run_cycle(cfg, model, device, log_path):
         save_json(resp_path, order_resp)
 
 
+def run_cycle(cfg, model, device, log_path, client):
+    lookback = compute_lookback(cfg)
+    df = client.get_klines(
+        cfg["papertrade"]["symbol"], cfg["papertrade"]["interval"], lookback
+    )
+    run_decision(cfg, model, device, log_path, client, df)
+
+
+def run_stream(cfg, model, device, log_path, client):
+    if websocket is None:
+        raise RuntimeError("websocket-client is not installed; install requirements.txt first")
+
+    symbol = cfg["papertrade"]["symbol"]
+    interval = cfg["papertrade"]["interval"]
+    use_closed_only = bool(cfg.get("papertrade", {}).get("ws_closed_only", True))
+    reconnect_seconds = float(cfg.get("papertrade", {}).get("ws_reconnect_seconds", 5))
+
+    lookback = compute_lookback(cfg)
+    df = client.get_klines(symbol, interval, lookback)
+    buffer = RollingOHLCVBuffer(df, max_len=lookback)
+
+    stream = f"{symbol.lower()}@kline_{interval}"
+    ws_url = build_ws_url(get_ws_base_url(cfg), stream)
+    last_timestamp = None
+
+    while True:
+        ws = None
+        try:
+            ws = websocket.create_connection(ws_url, timeout=30)
+            while True:
+                message = ws.recv()
+                if message is None:
+                    continue
+                parsed = parse_kline_message(message)
+                if not parsed:
+                    continue
+                if use_closed_only and not parsed["closed"]:
+                    continue
+                bar = parsed["bar"]
+                buffer.update(bar)
+                ts = int(bar["timestamp"])
+                if last_timestamp is not None and ts == last_timestamp:
+                    continue
+                last_timestamp = ts
+                run_decision(cfg, model, device, log_path, client, buffer.df)
+        except Exception as exc:
+            append_log(
+                log_path,
+                {
+                    "timestamp": int(time.time() * 1000),
+                    "status": "ERROR",
+                    "error": f"websocket_error: {exc}",
+                },
+            )
+            time.sleep(reconnect_seconds)
+        finally:
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.yaml")
@@ -419,16 +560,20 @@ def main():
     cfg = load_config(args.config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = load_checkpoint(args.ckpt).to(device)
+    client = create_client(cfg)
 
     log_path = cfg["papertrade"]["log_path"]
     ensure_dir(os.path.dirname(log_path))
 
     if args.loop:
-        while True:
-            run_cycle(cfg, model, device, log_path)
-            time.sleep(cfg["papertrade"]["poll_seconds"])
+        if cfg.get("papertrade", {}).get("use_websocket", False):
+            run_stream(cfg, model, device, log_path, client)
+        else:
+            while True:
+                run_cycle(cfg, model, device, log_path, client)
+                time.sleep(cfg["papertrade"]["poll_seconds"])
     else:
-        run_cycle(cfg, model, device, log_path)
+        run_cycle(cfg, model, device, log_path, client)
 
 
 if __name__ == "__main__":
