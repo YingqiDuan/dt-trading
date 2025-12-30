@@ -17,8 +17,9 @@ except Exception:
 
 from dt_model import DecisionTransformer
 from dt_utils import compute_step_reward, update_rtg
+from backtest import compute_metrics
 from features import build_features
-from utils import ensure_dir, load_config, save_json
+from utils import annualization_factor, ensure_dir, load_config, save_json
 
 
 def action_to_index(actions):
@@ -184,6 +185,169 @@ def compute_target_qty(cfg, action, price, equity):
     return float(action) * base_qty
 
 
+ALERT_STATE = {}
+
+
+def should_emit_alert(alert_type, timestamp, cooldown_seconds):
+    if cooldown_seconds <= 0:
+        return True
+    last_ts = ALERT_STATE.get(alert_type)
+    if last_ts is None or timestamp - last_ts >= cooldown_seconds * 1000:
+        ALERT_STATE[alert_type] = timestamp
+        return True
+    return False
+
+
+def append_alert(path, payload):
+    ensure_dir(os.path.dirname(path))
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+
+
+def load_feature_baseline(path):
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_feature_baseline(path, state_cols, mean, std):
+    payload = {"state_cols": list(state_cols), "mean": mean, "std": std}
+    ensure_dir(os.path.dirname(path))
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+
+
+def compute_feature_drift(state_window, baseline):
+    if baseline is None:
+        return None
+    base_mean = np.asarray(baseline.get("mean", []), dtype=np.float64)
+    base_std = np.asarray(baseline.get("std", []), dtype=np.float64)
+    if base_mean.size == 0 or base_std.size == 0:
+        return None
+    cur_mean = np.nanmean(state_window, axis=0)
+    cur_std = np.nanstd(state_window, axis=0)
+    denom = np.where(base_std > 1e-8, base_std, 1e-8)
+    mean_z = np.mean(np.abs(cur_mean - base_mean) / denom)
+    std_z = np.mean(np.abs(cur_std - base_std) / denom)
+    return float(max(mean_z, std_z))
+
+
+def compute_recent_metrics(df, interval, risk_free=0.0):
+    if df is None or df.empty or "equity" not in df.columns:
+        return None
+    equity = df["equity"].astype(float).to_numpy()
+    if equity.size < 2:
+        return None
+    step_returns = np.zeros_like(equity, dtype=np.float64)
+    step_returns[1:] = equity[1:] / equity[:-1] - 1.0
+    actions = df["action"].to_numpy() if "action" in df.columns else None
+    annual_factor = annualization_factor(interval)
+    return compute_metrics(
+        equity,
+        step_returns,
+        trade_count=0,
+        turnover=0.0,
+        annual_factor=annual_factor,
+        actions=actions,
+        risk_free=risk_free,
+    )
+
+
+def monitor_and_alert(cfg, log_path, state_window, state_cols, log_row, recent_logs):
+    monitor_cfg = cfg.get("papertrade", {}).get("monitoring", {})
+    if not monitor_cfg.get("enabled", False):
+        return
+
+    interval = cfg["papertrade"]["interval"]
+    cooldown = float(monitor_cfg.get("cooldown_seconds", 0.0))
+    alert_path = monitor_cfg.get("alert_log_path", None)
+    if not alert_path:
+        alert_path = log_path.replace("trade_log.csv", "alerts.jsonl")
+
+    timestamp = int(log_row.get("timestamp", int(time.time() * 1000)))
+    symbol = cfg["papertrade"]["symbol"]
+
+    def emit(alert_type, details):
+        if should_emit_alert(alert_type, timestamp, cooldown):
+            payload = {
+                "timestamp": timestamp,
+                "type": alert_type,
+                "symbol": symbol,
+                "interval": interval,
+                "details": details,
+            }
+            append_alert(alert_path, payload)
+
+    # Order anomalies
+    error = str(log_row.get("error", "")).strip()
+    if error:
+        emit("order_error", {"error": error})
+
+    status = str(log_row.get("status", "")).upper()
+    if status == "ERROR":
+        emit("order_error_status", {"status": status})
+
+    tolerance = float(monitor_cfg.get("position_tolerance", 0.0))
+    target_qty = float(log_row.get("target_qty", 0.0))
+    position_qty = float(log_row.get("position_qty", 0.0))
+    if abs(target_qty - position_qty) > tolerance and not error:
+        emit(
+            "position_mismatch",
+            {"target_qty": target_qty, "position_qty": position_qty},
+        )
+
+    # Error count in recent window
+    max_errors = monitor_cfg.get("max_error_count", None)
+    window_bars = int(monitor_cfg.get("window_bars", 0))
+    if max_errors is not None:
+        df = recent_logs.copy() if recent_logs is not None else pd.DataFrame()
+        df = pd.concat([df, pd.DataFrame([log_row])], ignore_index=True)
+        if window_bars > 0:
+            df = df.tail(window_bars)
+        if "status" in df.columns:
+            error_count = int((df["status"].astype(str).str.upper() == "ERROR").sum())
+            if error_count >= int(max_errors):
+                emit("order_error_rate", {"error_count": error_count, "window": len(df)})
+
+    # Strategy degradation
+    df = recent_logs.copy() if recent_logs is not None else pd.DataFrame()
+    df = pd.concat([df, pd.DataFrame([log_row])], ignore_index=True)
+    if window_bars > 0:
+        df = df.tail(window_bars)
+    metrics = compute_recent_metrics(df, interval, risk_free=float(cfg.get("backtest", {}).get("risk_free", 0.0)))
+    if metrics:
+        min_sharpe = monitor_cfg.get("min_sharpe", None)
+        if min_sharpe is not None and metrics["sharpe"] < float(min_sharpe):
+            emit("strategy_degrade_sharpe", {"sharpe": metrics["sharpe"]})
+        min_total_return = monitor_cfg.get("min_total_return", None)
+        if min_total_return is not None and metrics["total_return"] < float(min_total_return):
+            emit("strategy_degrade_return", {"total_return": metrics["total_return"]})
+        min_win_rate = monitor_cfg.get("min_win_rate", None)
+        if min_win_rate is not None and metrics.get("win_rate", 0.0) < float(min_win_rate):
+            emit("strategy_degrade_winrate", {"win_rate": metrics.get("win_rate", 0.0)})
+        max_dd = monitor_cfg.get("max_drawdown_pct", None)
+        if max_dd is not None and metrics["max_drawdown"] < -abs(float(max_dd)):
+            emit("strategy_degrade_drawdown", {"max_drawdown": metrics["max_drawdown"]})
+
+    # Data drift
+    drift_threshold = monitor_cfg.get("drift_zscore_threshold", None)
+    if drift_threshold is not None:
+        baseline_path = monitor_cfg.get(
+            "baseline_path", log_path.replace("trade_log.csv", "feature_baseline.json")
+        )
+        baseline = load_feature_baseline(baseline_path)
+        if baseline is None or baseline.get("state_cols") != list(state_cols):
+            mean = np.nanmean(state_window, axis=0).tolist()
+            std = np.nanstd(state_window, axis=0).tolist()
+            save_feature_baseline(baseline_path, state_cols, mean, std)
+        else:
+            drift_score = compute_feature_drift(state_window, baseline)
+            if drift_score is not None and drift_score > float(drift_threshold):
+                emit("data_drift", {"score": drift_score, "threshold": drift_threshold})
 def create_client(cfg):
     api_key = os.getenv(cfg["papertrade"]["api_key_env"], "")
     api_secret = os.getenv(cfg["papertrade"]["api_secret_env"], "")
@@ -571,6 +735,7 @@ def run_decision(cfg, model, device, log_path, client, df):
     log_row["reward"] = float(current_reward)
     log_row["rtg"] = float(current_rtg)
 
+    monitor_and_alert(cfg, log_path, state_window, state_cols, log_row, recent_logs)
     append_log(log_path, log_row)
 
     if order_resp is not None:

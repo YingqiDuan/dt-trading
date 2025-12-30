@@ -99,6 +99,7 @@ python walk_forward.py --config config.yaml
 - `papertrade.ws_base_url`: override websocket base URL if needed.
 - `papertrade.position_sizing`: dynamic sizing options (`fixed_qty`, `fixed_notional`, `equity_fraction`).
 - `papertrade.stop_loss_pct` / `papertrade.max_drawdown_pct`: stop-loss and kill-switch thresholds.
+- `papertrade.monitoring`: alerting for strategy degradation, order anomalies, and data drift (writes `alerts.jsonl`).
 - `walk_forward.*`: rolling window sizes in bars; outputs to `outputs/walk_forward/`.
 
 ## Environment Variables

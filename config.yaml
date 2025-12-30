@@ -152,6 +152,19 @@ papertrade:
     max_qty: null
     max_position_notional: null
   max_drawdown_pct: 0.3
+  monitoring:
+    enabled: true
+    window_bars: 256
+    min_sharpe: null
+    min_total_return: null
+    min_win_rate: null
+    max_drawdown_pct: null
+    max_error_count: 3
+    position_tolerance: 0.0
+    drift_zscore_threshold: 3.0
+    baseline_path: outputs/papertrade/feature_baseline.json
+    alert_log_path: outputs/papertrade/alerts.jsonl
+    cooldown_seconds: 300
   log_path: outputs/papertrade/trade_log.csv
   api_key_env: "BINANCE_API_KEY"
   api_secret_env: "BINANCE_API_SECRET"
