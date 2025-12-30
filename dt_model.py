@@ -16,18 +16,19 @@ class DecisionTransformer(nn.Module):
         use_value_head=True,
     ):
         super().__init__()
-        self.state_dim = state_dim
-        self.act_dim = act_dim
         self.seq_len = seq_len
         self.d_model = d_model
         self.action_mode = action_mode
 
         self.state_emb = nn.Linear(state_dim, d_model)
         self.rtg_emb = nn.Linear(1, d_model)
-        if self.action_mode == "continuous":
+        if action_mode == "continuous":
             self.action_emb = nn.Linear(act_dim, d_model)
+            self.log_std = nn.Parameter(torch.zeros(act_dim))
         else:
             self.action_emb = nn.Embedding(act_dim, d_model)
+            self.log_std = None
+
         self.pos_emb = nn.Parameter(torch.zeros(1, seq_len * 3, d_model))
 
         encoder_layer = nn.TransformerEncoderLayer(
@@ -39,41 +40,43 @@ class DecisionTransformer(nn.Module):
             batch_first=True,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
         self.action_head = nn.Linear(d_model, act_dim)
         self.value_head = nn.Linear(d_model, 1) if use_value_head else None
-        self.log_std = (
-            nn.Parameter(torch.zeros(act_dim)) if self.action_mode == "continuous" else None
-        )
 
     def forward(self, states, actions, rtg, return_values=False):
-        # states: (B, T, state_dim), actions: (B, T) or (B, T, act_dim), rtg: (B, T)
-        bsz, tlen, _ = states.shape
-        if tlen > self.seq_len:
-            raise ValueError(f"sequence length {tlen} exceeds model max {self.seq_len}")
+        B, T, _ = states.shape
+        if T > self.seq_len:
+            raise ValueError(f"sequence length {T} exceeds model max {self.seq_len}")
 
-        if self.action_mode == "continuous" and actions.dim() == 2:
-            actions = actions.unsqueeze(-1)
+        # Embeddings
+        rtg_emb = self.rtg_emb(rtg.unsqueeze(-1))
+        state_emb = self.state_emb(states)
 
-        rtg_tokens = self.rtg_emb(rtg.unsqueeze(-1))
-        state_tokens = self.state_emb(states)
         if self.action_mode == "continuous":
-            action_tokens = self.action_emb(actions.float())
+            if actions.dim() == 2:
+                actions = actions.unsqueeze(-1)
+            act_emb = self.action_emb(actions.float())
         else:
-            action_tokens = self.action_emb(actions.long())
+            act_emb = self.action_emb(actions.long())
 
-        tokens = torch.stack((rtg_tokens, state_tokens, action_tokens), dim=2)
-        tokens = tokens.reshape(bsz, tlen * 3, self.d_model)
-        tokens = tokens + self.pos_emb[:, : tlen * 3, :]
-
-        mask = torch.triu(
-            torch.ones(tlen * 3, tlen * 3, device=tokens.device, dtype=torch.bool),
-            diagonal=1,
+        # Stack & Reshape: (B, T, 3, D) -> (B, T*3, D)
+        x = torch.stack((rtg_emb, state_emb, act_emb), dim=2).reshape(
+            B, T * 3, self.d_model
         )
-        hidden = self.transformer(tokens, mask)
-        action_positions = torch.arange(2, tlen * 3, 3, device=tokens.device)
-        action_hidden = hidden[:, action_positions, :]
-        logits = self.action_head(action_hidden)
+        x = x + self.pos_emb[:, : T * 3]
+
+        # Causal Mask & Transformer
+        mask = torch.triu(
+            torch.ones(T * 3, T * 3, device=x.device, dtype=torch.bool), diagonal=1
+        )
+        h = self.transformer(x, mask)
+
+        # Predict actions using the 3rd token of each step (indices 2, 5, 8...)
+        h_act = h[:, 2::3]
+        logits = self.action_head(h_act)
+
         if self.value_head is None or not return_values:
             return logits
-        values = self.value_head(action_hidden).squeeze(-1)
-        return logits, values
+
+        return logits, self.value_head(h_act).squeeze(-1)
