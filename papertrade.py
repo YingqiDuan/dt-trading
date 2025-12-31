@@ -108,6 +108,7 @@ class BinanceClient:
         self.key, self.sec = os.getenv(cfg["papertrade"]["api_key_env"]), os.getenv(
             cfg["papertrade"]["api_secret_env"]
         )
+        self._step_size_cache = {}
 
     def req(self, method, path, params=None, signed=False):
         p = params or {}
@@ -155,6 +156,27 @@ class BinanceClient:
             ),
             0.0,
         )
+
+    def get_step_size(self, sym):
+        if sym in self._step_size_cache:
+            return self._step_size_cache[sym]
+        info = self.req("GET", "/fapi/v1/exchangeInfo", {"symbol": sym})
+        symbols = info.get("symbols", [])
+        if not symbols:
+            return None
+        filters = symbols[0].get("filters", [])
+        step_size = None
+        for filter_type in ("LOT_SIZE", "MARKET_LOT_SIZE"):
+            for f in filters:
+                if f.get("filterType") == filter_type and f.get("stepSize") is not None:
+                    step_size = float(f["stepSize"])
+                    break
+            if step_size is not None:
+                break
+        if step_size is None:
+            return None
+        self._step_size_cache[sym] = step_size
+        return step_size
 
     def order(self, sym, side, qty):
         return self.req(
@@ -387,7 +409,13 @@ def run_decision(cfg, model, dev, path, client, df):
     # 9. 执行交易 (Execution)
     err, ord_res = "", None
     delta = tgt_qty - cur_qty
-    step_size = float(cfg["papertrade"].get("step_size", 0.001) or 0.001)
+    step_size = None
+    try:
+        step_size = client.get_step_size(sym)
+    except Exception:
+        step_size = None
+    if step_size is None:
+        step_size = float(cfg["papertrade"].get("step_size", 0.001) or 0.001)
     qty_to_order = round_step_size(abs(delta), step_size)
     min_qty = float(sz.get("min_qty", 0.0))
     if not dry and qty_to_order >= min_qty and qty_to_order > 0:
