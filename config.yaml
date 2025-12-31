@@ -107,9 +107,9 @@ rl:
   action_dim: 1
   gamma: 0.99  # fallback if dataset.rtg_gamma is not set
   reward_scale: 100.0
-  turnover_penalty: 0.0
-  position_penalty: 0.0
-  drawdown_penalty: 0.0
+  turnover_penalty: 0.1
+  position_penalty: 0.1
+  drawdown_penalty: 0.1
   eval_every: 1
   eval_mode: deterministic  # deterministic|sample
   eval_samples: 5

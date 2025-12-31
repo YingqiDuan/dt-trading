@@ -1,18 +1,10 @@
-import argparse
-import hashlib
-import hmac
-import json
-import os
-import time
+import argparse, hashlib, hmac, json, math, os, time, requests, torch
+import numpy as np, pandas as pd
 from urllib.parse import urlencode
 
-import numpy as np
-import pandas as pd
-import requests
-import torch
 try:
     import websocket
-except Exception:
+except ImportError:
     websocket = None
 
 from dt_model import DecisionTransformer
@@ -22,815 +14,514 @@ from features import build_features
 from utils import annualization_factor, ensure_dir, load_config, save_json
 
 
-def action_to_index(actions):
-    return actions + 1
+# --- 辅助函数 ---
+def to_act_idx(x):
+    return x + 1
 
 
-def index_to_action(index):
-    return index - 1
+def from_act_idx(x):
+    return x - 1
 
 
-def load_checkpoint(ckpt_path):
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    cfg = ckpt["model_config"]
-    model = DecisionTransformer(
-        state_dim=cfg["state_dim"],
-        act_dim=cfg["act_dim"],
-        seq_len=cfg["seq_len"],
-        d_model=cfg["d_model"],
-        n_layers=cfg["n_layers"],
-        n_heads=cfg["n_heads"],
-        dropout=cfg["dropout"],
-        action_mode=cfg.get("action_mode", "discrete"),
-        use_value_head=bool(cfg.get("use_value_head", False)),
+def get_ms(iv):
+    return int(iv[:-1]) * {"m": 60, "h": 3600, "d": 86400}[iv[-1]] * 1000
+
+
+def round_step_size(quantity, step_size):
+    if step_size <= 0:
+        return quantity
+    if quantity < step_size:
+        return 0.0
+    return math.floor(quantity / step_size) * step_size
+
+
+def load_ckpt(path, device):
+    ckpt = torch.load(path, map_location=device)
+    c = ckpt["model_config"]
+    m = DecisionTransformer(
+        c["state_dim"],
+        c["act_dim"],
+        c["seq_len"],
+        c["d_model"],
+        c["n_layers"],
+        c["n_heads"],
+        c["dropout"],
+        action_mode=c.get("action_mode", "discrete"),
+        use_value_head=c.get("use_value_head", False),
+    ).to(device)
+    m.load_state_dict(ckpt["model_state"], strict=False)
+    m.eval()
+    return m
+
+
+def get_lookback(cfg):
+    f = cfg["features"]
+    wins = f.get("ema_windows", []) + [
+        f.get("volatility_window", 0),
+        f.get("rsi_window", 0),
+        f.get("volume_z_window", 0),
+        f.get("zscore_window", 0),
+        f.get("boll_window", 0),
+        f.get("macd_slow", 0),
+    ]
+    return int(cfg["dataset"]["seq_len"]) + max(wins) + int(f["zscore_window"]) + 5
+
+
+def log_csv(path, row):
+    ensure_dir(os.path.dirname(path))
+    pd.DataFrame([row]).to_csv(
+        path, mode="a", header=not os.path.exists(path), index=False
     )
-    model.load_state_dict(ckpt["model_state"], strict=False)
-    model.eval()
-    return model
 
 
-def interval_to_millis(interval):
-    unit = interval[-1]
-    amount = int(interval[:-1])
-    if unit == "m":
-        return amount * 60_000
-    if unit == "h":
-        return amount * 3_600_000
-    if unit == "d":
-        return amount * 86_400_000
-    raise ValueError(f"unsupported interval {interval}")
+def load_logs(path, n=0):
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    df = pd.read_csv(path)
+    return df.tail(n).reset_index(drop=True) if n else df
 
 
-def compute_lookback(cfg):
-    seq_len = int(cfg["dataset"]["seq_len"])
-    ema_windows = [int(w) for w in cfg["features"].get("ema_windows", [])]
-    ema_max = max(ema_windows) if ema_windows else 0
-    boll_window = int(cfg["features"].get("boll_window", 0))
-    macd_fast = int(cfg["features"].get("macd_fast", 0))
-    macd_slow = int(cfg["features"].get("macd_slow", 0))
-    macd_signal = int(cfg["features"].get("macd_signal", 0))
-    max_window = max(
-        cfg["features"]["volatility_window"],
-        cfg["features"]["rsi_window"],
-        cfg["features"]["volume_z_window"],
-        cfg["features"]["zscore_window"],
-        ema_max,
-        boll_window,
-        macd_fast,
-        macd_slow,
-        macd_signal,
-    )
-    return seq_len + max_window + cfg["features"]["zscore_window"] + 5
-
-
-def get_ws_base_url(cfg):
-    override = cfg.get("papertrade", {}).get("ws_base_url", None)
-    if override:
-        return str(override).rstrip("/")
-    base_url = str(cfg["papertrade"]["base_url"]).lower()
-    if "demo-fapi" in base_url or "testnet" in base_url:
-        return "wss://stream.binancefuture.com"
-    return "wss://fstream.binance.com"
-
-
-def build_ws_url(base_url, stream):
-    base_url = base_url.rstrip("/")
-    if base_url.endswith("/ws"):
-        return f"{base_url}/{stream}"
-    return f"{base_url}/ws/{stream}"
-
-
-def parse_kline_message(message):
-    try:
-        data = json.loads(message)
-    except (TypeError, json.JSONDecodeError):
-        return None
-    if data.get("e") != "kline":
-        return None
-    kline = data.get("k", {})
-    try:
-        bar = {
-            "timestamp": int(kline["t"]),
-            "open": float(kline["o"]),
-            "high": float(kline["h"]),
-            "low": float(kline["l"]),
-            "close": float(kline["c"]),
-            "volume": float(kline["v"]),
-        }
-    except (KeyError, TypeError, ValueError):
-        return None
-    return {"bar": bar, "closed": bool(kline.get("x", False))}
-
-
-class RollingOHLCVBuffer:
+# --- 核心类 ---
+class RollingBuffer:
     def __init__(self, df, max_len):
-        self.max_len = int(max_len) if max_len is not None else 0
-        self.df = df.copy()
-        if not self.df.empty:
-            self.df = (
-                self.df.drop_duplicates(subset=["timestamp"])
-                .sort_values("timestamp")
-                .reset_index(drop=True)
-            )
-            if self.max_len and len(self.df) > self.max_len:
-                self.df = self.df.tail(self.max_len).reset_index(drop=True)
+        self.max, self.df = max_len, df.drop_duplicates("timestamp").sort_values(
+            "timestamp"
+        ).reset_index(drop=True)
+        if max_len and len(self.df) > max_len:
+            self.df = self.df.tail(max_len).reset_index(drop=True)
 
     def update(self, bar):
         ts = int(bar["timestamp"])
-        if self.df.empty:
-            self.df = pd.DataFrame([bar])
+        if not self.df.empty and self.df.iloc[-1]["timestamp"] == ts:
+            for k, v in bar.items():
+                self.df.at[self.df.index[-1], k] = v
         else:
-            match = self.df.index[self.df["timestamp"] == ts]
-            if len(match) > 0:
-                idx = match[-1]
-                for col, val in bar.items():
-                    self.df.at[idx, col] = val
-            else:
-                self.df = pd.concat([self.df, pd.DataFrame([bar])], ignore_index=True)
-        self.df = self.df.sort_values("timestamp").reset_index(drop=True)
-        if self.max_len and len(self.df) > self.max_len:
-            self.df = self.df.tail(self.max_len).reset_index(drop=True)
+            self.df = pd.concat([self.df, pd.DataFrame([bar])], ignore_index=True)
         self.df["datetime"] = pd.to_datetime(self.df["timestamp"], unit="ms", utc=True)
+        if self.max and len(self.df) > self.max:
+            self.df = self.df.tail(self.max).reset_index(drop=True)
 
 
-def compute_target_qty(cfg, action, price, equity):
-    sizing_cfg = cfg.get("papertrade", {}).get("position_sizing", {})
-    mode = str(sizing_cfg.get("mode", "fixed_qty")).lower()
-    if price <= 0:
-        return 0.0
-
-    if mode == "fixed_qty":
-        base_qty = float(sizing_cfg.get("fixed_qty", cfg["papertrade"].get("trade_qty", 0.0)))
-    elif mode == "fixed_notional":
-        notional = float(sizing_cfg.get("fixed_notional", 0.0))
-        base_qty = notional / price
-    elif mode == "equity_fraction":
-        fraction = float(sizing_cfg.get("equity_fraction", 0.0))
-        base_qty = equity * fraction / price
-    else:
-        raise ValueError(f"unsupported position_sizing mode {mode}")
-
-    max_notional = sizing_cfg.get("max_position_notional", None)
-    if max_notional is not None:
-        max_qty = float(max_notional) / price
-        base_qty = min(base_qty, max_qty)
-
-    min_qty = float(sizing_cfg.get("min_qty", 0.0))
-    max_qty = sizing_cfg.get("max_qty", None)
-    if max_qty is not None:
-        base_qty = min(base_qty, float(max_qty))
-    if base_qty < min_qty:
-        base_qty = 0.0
-
-    return float(action) * base_qty
-
-
-ALERT_STATE = {}
-
-
-def should_emit_alert(alert_type, timestamp, cooldown_seconds):
-    if cooldown_seconds <= 0:
-        return True
-    last_ts = ALERT_STATE.get(alert_type)
-    if last_ts is None or timestamp - last_ts >= cooldown_seconds * 1000:
-        ALERT_STATE[alert_type] = timestamp
-        return True
-    return False
-
-
-def append_alert(path, payload):
-    ensure_dir(os.path.dirname(path))
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, ensure_ascii=True) + "\n")
-
-
-def load_feature_baseline(path):
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-
-def save_feature_baseline(path, state_cols, mean, std):
-    payload = {"state_cols": list(state_cols), "mean": mean, "std": std}
-    ensure_dir(os.path.dirname(path))
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, sort_keys=True)
-
-
-def compute_feature_drift(state_window, baseline):
-    if baseline is None:
-        return None
-    base_mean = np.asarray(baseline.get("mean", []), dtype=np.float64)
-    base_std = np.asarray(baseline.get("std", []), dtype=np.float64)
-    if base_mean.size == 0 or base_std.size == 0:
-        return None
-    cur_mean = np.nanmean(state_window, axis=0)
-    cur_std = np.nanstd(state_window, axis=0)
-    denom = np.where(base_std > 1e-8, base_std, 1e-8)
-    mean_z = np.mean(np.abs(cur_mean - base_mean) / denom)
-    std_z = np.mean(np.abs(cur_std - base_std) / denom)
-    return float(max(mean_z, std_z))
-
-
-def compute_recent_metrics(df, interval, risk_free=0.0):
-    if df is None or df.empty or "equity" not in df.columns:
-        return None
-    equity = df["equity"].astype(float).to_numpy()
-    if equity.size < 2:
-        return None
-    step_returns = np.zeros_like(equity, dtype=np.float64)
-    step_returns[1:] = equity[1:] / equity[:-1] - 1.0
-    actions = df["action"].to_numpy() if "action" in df.columns else None
-    annual_factor = annualization_factor(interval)
-    return compute_metrics(
-        equity,
-        step_returns,
-        trade_count=0,
-        turnover=0.0,
-        annual_factor=annual_factor,
-        actions=actions,
-        risk_free=risk_free,
-    )
-
-
-def monitor_and_alert(cfg, log_path, state_window, state_cols, log_row, recent_logs):
-    monitor_cfg = cfg.get("papertrade", {}).get("monitoring", {})
-    if not monitor_cfg.get("enabled", False):
-        return
-
-    interval = cfg["papertrade"]["interval"]
-    cooldown = float(monitor_cfg.get("cooldown_seconds", 0.0))
-    alert_path = monitor_cfg.get("alert_log_path", None)
-    if not alert_path:
-        alert_path = log_path.replace("trade_log.csv", "alerts.jsonl")
-
-    timestamp = int(log_row.get("timestamp", int(time.time() * 1000)))
-    symbol = cfg["papertrade"]["symbol"]
-
-    def emit(alert_type, details):
-        if should_emit_alert(alert_type, timestamp, cooldown):
-            payload = {
-                "timestamp": timestamp,
-                "type": alert_type,
-                "symbol": symbol,
-                "interval": interval,
-                "details": details,
-            }
-            append_alert(alert_path, payload)
-
-    # Order anomalies
-    error = str(log_row.get("error", "")).strip()
-    if error:
-        emit("order_error", {"error": error})
-
-    status = str(log_row.get("status", "")).upper()
-    if status == "ERROR":
-        emit("order_error_status", {"status": status})
-
-    tolerance = float(monitor_cfg.get("position_tolerance", 0.0))
-    target_qty = float(log_row.get("target_qty", 0.0))
-    position_qty = float(log_row.get("position_qty", 0.0))
-    if abs(target_qty - position_qty) > tolerance and not error:
-        emit(
-            "position_mismatch",
-            {"target_qty": target_qty, "position_qty": position_qty},
+class BinanceClient:
+    def __init__(self, cfg):
+        self.base = cfg["papertrade"]["base_url"].rstrip("/")
+        self.key, self.sec = os.getenv(cfg["papertrade"]["api_key_env"]), os.getenv(
+            cfg["papertrade"]["api_secret_env"]
         )
 
-    # Error count in recent window
-    max_errors = monitor_cfg.get("max_error_count", None)
-    window_bars = int(monitor_cfg.get("window_bars", 0))
-    if max_errors is not None:
-        df = recent_logs.copy() if recent_logs is not None else pd.DataFrame()
-        df = pd.concat([df, pd.DataFrame([log_row])], ignore_index=True)
-        if window_bars > 0:
-            df = df.tail(window_bars)
-        if "status" in df.columns:
-            error_count = int((df["status"].astype(str).str.upper() == "ERROR").sum())
-            if error_count >= int(max_errors):
-                emit("order_error_rate", {"error_count": error_count, "window": len(df)})
-
-    # Strategy degradation
-    df = recent_logs.copy() if recent_logs is not None else pd.DataFrame()
-    df = pd.concat([df, pd.DataFrame([log_row])], ignore_index=True)
-    if window_bars > 0:
-        df = df.tail(window_bars)
-    metrics = compute_recent_metrics(df, interval, risk_free=float(cfg.get("backtest", {}).get("risk_free", 0.0)))
-    if metrics:
-        min_sharpe = monitor_cfg.get("min_sharpe", None)
-        if min_sharpe is not None and metrics["sharpe"] < float(min_sharpe):
-            emit("strategy_degrade_sharpe", {"sharpe": metrics["sharpe"]})
-        min_total_return = monitor_cfg.get("min_total_return", None)
-        if min_total_return is not None and metrics["total_return"] < float(min_total_return):
-            emit("strategy_degrade_return", {"total_return": metrics["total_return"]})
-        min_win_rate = monitor_cfg.get("min_win_rate", None)
-        if min_win_rate is not None and metrics.get("win_rate", 0.0) < float(min_win_rate):
-            emit("strategy_degrade_winrate", {"win_rate": metrics.get("win_rate", 0.0)})
-        max_dd = monitor_cfg.get("max_drawdown_pct", None)
-        if max_dd is not None and metrics["max_drawdown"] < -abs(float(max_dd)):
-            emit("strategy_degrade_drawdown", {"max_drawdown": metrics["max_drawdown"]})
-
-    # Data drift
-    drift_threshold = monitor_cfg.get("drift_zscore_threshold", None)
-    if drift_threshold is not None:
-        baseline_path = monitor_cfg.get(
-            "baseline_path", log_path.replace("trade_log.csv", "feature_baseline.json")
-        )
-        baseline = load_feature_baseline(baseline_path)
-        if baseline is None or baseline.get("state_cols") != list(state_cols):
-            mean = np.nanmean(state_window, axis=0).tolist()
-            std = np.nanstd(state_window, axis=0).tolist()
-            save_feature_baseline(baseline_path, state_cols, mean, std)
-        else:
-            drift_score = compute_feature_drift(state_window, baseline)
-            if drift_score is not None and drift_score > float(drift_threshold):
-                emit("data_drift", {"score": drift_score, "threshold": drift_threshold})
-def create_client(cfg):
-    api_key = os.getenv(cfg["papertrade"]["api_key_env"], "")
-    api_secret = os.getenv(cfg["papertrade"]["api_secret_env"], "")
-    return BinanceFuturesClient(cfg["papertrade"]["base_url"], api_key, api_secret)
-
-
-class BinanceFuturesClient:
-    def __init__(self, base_url, api_key=None, api_secret=None):
-        self.base_url = base_url.rstrip("/")
-        self.api_key = api_key
-        self.api_secret = api_secret
-
-    def _headers(self):
-        headers = {}
-        if self.api_key:
-            headers["X-MBX-APIKEY"] = self.api_key
-        return headers
-
-    def _sign(self, params):
-        if not self.api_secret:
-            raise ValueError("api_secret required for signed endpoint")
-        query = urlencode(params)
-        signature = hmac.new(self.api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
-        params["signature"] = signature
-        return params
-
-    def request(self, method, path, params=None, signed=False):
-        params = params or {}
+    def req(self, method, path, params=None, signed=False):
+        p = params or {}
         if signed:
-            params["timestamp"] = int(time.time() * 1000)
-            params["recvWindow"] = 5000
-            params = self._sign(params)
-        url = f"{self.base_url}{path}"
-        resp = requests.request(method, url, params=params, headers=self._headers(), timeout=10)
-        resp.raise_for_status()
-        return resp.json()
+            p.update({"timestamp": int(time.time() * 1000), "recvWindow": 5000})
+            p["signature"] = hmac.new(
+                self.sec.encode(), urlencode(p).encode(), hashlib.sha256
+            ).hexdigest()
+        r = requests.request(
+            method,
+            f"{self.base}{path}",
+            params=p,
+            headers={"X-MBX-APIKEY": self.key} if self.key else {},
+            timeout=10,
+        )
+        r.raise_for_status()
+        return r.json()
 
-    def get_klines(self, symbol, interval, limit):
-        params = {"symbol": symbol, "interval": interval, "limit": limit}
-        data = self.request("GET", "/fapi/v1/klines", params=params)
-        rows = []
-        for row in data:
-            rows.append(
+    def klines(self, sym, iv, limit):
+        d = self.req(
+            "GET", "/fapi/v1/klines", {"symbol": sym, "interval": iv, "limit": limit}
+        )
+        df = pd.DataFrame(
+            [
                 {
-                    "timestamp": int(row[0]),
-                    "open": float(row[1]),
-                    "high": float(row[2]),
-                    "low": float(row[3]),
-                    "close": float(row[4]),
-                    "volume": float(row[5]),
+                    "timestamp": int(r[0]),
+                    "open": float(r[1]),
+                    "high": float(r[2]),
+                    "low": float(r[3]),
+                    "close": float(r[4]),
+                    "volume": float(r[5]),
                 }
-            )
-        df = pd.DataFrame(rows)
+                for r in d
+            ]
+        )
         df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
         return df
 
-    def get_position_qty(self, symbol):
-        data = self.request("GET", "/fapi/v2/positionRisk", signed=True)
-        for row in data:
-            if row.get("symbol") == symbol:
-                return float(row.get("positionAmt", 0.0))
-        return 0.0
+    def pos(self, sym):
+        return next(
+            (
+                float(x["positionAmt"])
+                for x in self.req("GET", "/fapi/v2/positionRisk", signed=True)
+                if x["symbol"] == sym
+            ),
+            0.0,
+        )
 
-    def place_order(self, symbol, side, qty):
-        params = {
-            "symbol": symbol,
-            "side": side,
-            "type": "MARKET",
-            "quantity": qty,
-            "newOrderRespType": "RESULT",
-        }
-        return self.request("POST", "/fapi/v1/order", params=params, signed=True)
-
-
-def load_recent_logs(log_path, max_len):
-    if not os.path.exists(log_path):
-        return pd.DataFrame()
-    df = pd.read_csv(log_path)
-    if df.empty:
-        return df
-    return df.tail(max_len).reset_index(drop=True)
+    def order(self, sym, side, qty):
+        return self.req(
+            "POST",
+            "/fapi/v1/order",
+            {"symbol": sym, "side": side, "type": "MARKET", "quantity": qty},
+            signed=True,
+        )
 
 
-def load_last_log(log_path):
-    if not os.path.exists(log_path):
-        return None
-    df = pd.read_csv(log_path)
-    if df.empty:
-        return None
-    return df.iloc[-1]
+# --- 监控与风控 ---
+ALERT_CACHE = {}
 
 
-def compute_equity(prev, close, target_pos, fee, slip, initial_cash):
-    if prev is None:
-        return initial_cash
-    prev_close = float(prev.get("close", close))
-    prev_pos = float(prev.get("target_position", prev.get("position", 0.0)))
-    prev_equity = float(prev.get("equity", initial_cash))
-    ret = (close / prev_close) - 1.0
-    trade_cost = (fee + slip) * abs(target_pos - prev_pos)
-    return prev_equity * (1.0 + prev_pos * ret - trade_cost)
+def monitor(cfg, log_path, state, cols, row, logs):
+    mc = cfg.get("papertrade", {}).get("monitoring", {})
+    if not mc.get("enabled", False):
+        return
+    ts, cd = row.get("timestamp", int(time.time() * 1000)), float(
+        mc.get("cooldown_seconds", 0)
+    )
+
+    def emit(type, det):
+        if ts - ALERT_CACHE.get(type, 0) >= cd * 1000:
+            ALERT_CACHE[type] = ts
+            with open(
+                mc.get("alert_log_path") or log_path.replace(".csv", ".jsonl"), "a"
+            ) as f:
+                f.write(
+                    json.dumps({"timestamp": ts, "type": type, "details": det}) + "\n"
+                )
+
+    err, status = str(row.get("error", "")).strip(), str(row.get("status", "")).upper()
+    if err:
+        emit("order_error", {"error": err})
+    if status == "ERROR":
+        emit("order_error_status", {"status": status})
+
+    t_qty, p_qty = float(row.get("target_qty", 0)), float(row.get("position_qty", 0))
+    if abs(t_qty - p_qty) > float(mc.get("position_tolerance", 0)) and not err:
+        emit("position_mismatch", {"target": t_qty, "actual": p_qty})
+
+    df = pd.concat(
+        [logs or pd.DataFrame(), pd.DataFrame([row])], ignore_index=True
+    ).tail(int(mc.get("window_bars", 256)))
+    if len(df) > 1 and "equity" in df:
+        met = compute_metrics(
+            df["equity"].values,
+            np.append([0], df["equity"].pct_change().dropna().values),
+            0,
+            0,
+            annualization_factor(cfg["papertrade"]["interval"]),
+        )
+        for k, v in {
+            "sharpe": "min_sharpe",
+            "total_return": "min_total_return",
+            "win_rate": "min_win_rate",
+        }.items():
+            if (th := mc.get(v)) is not None and met.get(k, 0) < float(th):
+                emit(f"degrade_{k}", {k: met[k]})
+        if (md := mc.get("max_drawdown_pct")) and met["max_drawdown"] < -abs(float(md)):
+            emit("degrade_drawdown", {"drawdown": met["max_drawdown"]})
+
+    # Data Drift
+    if th := mc.get("drift_zscore_threshold"):
+        base_p = mc.get("baseline_path") or log_path.replace(".csv", "_base.json")
+        try:
+            base = json.load(open(base_p))
+        except:
+            base = None
+        if not base or base["cols"] != list(cols):
+            json.dump(
+                {
+                    "cols": list(cols),
+                    "mean": np.nanmean(state, 0).tolist(),
+                    "std": np.nanstd(state, 0).tolist(),
+                },
+                open(base_p, "w"),
+            )
+        else:
+            z = np.max(
+                np.abs(np.nanmean(state, 0) - base["mean"])
+                / (np.array(base["std"]) + 1e-8)
+            )
+            if z > float(th):
+                emit("data_drift", {"score": z})
 
 
-def append_log(path, row):
-    ensure_dir(os.path.dirname(path))
-    df = pd.DataFrame([row])
-    df.to_csv(path, mode="a", header=not os.path.exists(path), index=False)
-
-
-def run_decision(cfg, model, device, log_path, client, df):
-    action_mode = getattr(model, "action_mode", "discrete")
-    reward_fee = float(cfg["rewards"]["fee"])
-    reward_slip = float(cfg["rewards"]["slip"])
-    reward_scale = float(cfg.get("rl", {}).get("reward_scale", 1.0))
-    turnover_penalty = float(cfg.get("rl", {}).get("turnover_penalty", 0.0))
-    position_penalty = float(cfg.get("rl", {}).get("position_penalty", 0.0))
-    drawdown_penalty = float(cfg.get("rl", {}).get("drawdown_penalty", 0.0))
-    price_mode = cfg["rewards"].get("price_mode", "close")
-    range_penalty = float(cfg["rewards"].get("range_penalty", 0.0))
-
-    dataset_cfg = cfg.get("dataset", {})
-    target_return = float(dataset_cfg.get("target_return", 0.0))
-    rtg_scale = float(dataset_cfg.get("rtg_scale", 1.0))
-    if rtg_scale <= 0:
-        rtg_scale = 1.0
-    gamma = float(dataset_cfg.get("rtg_gamma", cfg.get("rl", {}).get("gamma", 1.0)))
-
-    seq_len = cfg["dataset"]["seq_len"]
-    feat_df, state_cols = build_features(df, cfg["features"])
-    feat_df = feat_df.dropna(subset=state_cols).reset_index(drop=True)
-
-    if len(feat_df) < seq_len:
-        append_log(
-            log_path,
+# --- 主逻辑 ---
+def run_decision(cfg, model, dev, path, client, df):
+    # 1. 特征工程
+    sl, fee, slip = (
+        int(cfg["dataset"]["seq_len"]),
+        float(cfg["rewards"]["fee"]),
+        float(cfg["rewards"]["slip"]),
+    )
+    feat, cols = build_features(df, cfg["features"])
+    feat = feat.dropna(subset=cols).reset_index(drop=True)
+    if len(feat) < sl:
+        return log_csv(
+            path,
             {
                 "timestamp": int(time.time() * 1000),
                 "status": "ERROR",
-                "error": "insufficient history for features",
+                "error": "history_too_short",
             },
         )
+
+    # 2. 加载历史上下文 (Logs)
+    row = feat.iloc[-1]
+    ts, logs = int(row["timestamp"]), load_logs(path, sl + 1)
+    if not logs.empty and int(logs.iloc[-1].get("timestamp", 0)) == ts:
         return
 
-    last_row = feat_df.iloc[-1]
-    last_timestamp = int(last_row["timestamp"])
-    last_log = load_last_log(log_path)
-    if last_log is not None and int(last_log.get("timestamp", 0)) == last_timestamp:
-        return
-
-    state_window = feat_df[state_cols].tail(seq_len).to_numpy(dtype=np.float32)
-    recent_logs = load_recent_logs(log_path, seq_len + 1)
-    if not recent_logs.empty and "action" in recent_logs:
-        if action_mode == "continuous":
-            action_hist = recent_logs["action"].astype(float).tolist()
-        else:
-            action_hist = recent_logs["action"].astype(int).tolist()
-    else:
-        action_hist = []
-    reward_hist = (
-        recent_logs["reward"].astype(float).tolist()
-        if not recent_logs.empty and "reward" in recent_logs
-        else []
+    # 3. 构建输入序列
+    # 从日志中提取过去的 Action，如果没有则填充 0
+    act_mode = getattr(model, "action_mode", "discrete")
+    acts = (logs["action"].values if not logs.empty else np.zeros(sl)).astype(
+        float if act_mode == "continuous" else int
+    )[-sl:]
+    p_act = acts[-1] if len(acts) > 0 else 0
+    p_eq = (
+        float(logs.iloc[-1]["equity"])
+        if not logs.empty
+        else float(cfg["backtest"]["initial_cash"])
     )
 
-    if action_mode == "continuous":
-        actions_in = np.zeros((seq_len, 1), dtype=np.float32)
-        if action_hist:
-            hist = action_hist[-(seq_len - 1) :]
-            actions_in[-len(hist) :, 0] = hist
-            if len(action_hist) >= seq_len:
-                actions_in[0, 0] = float(action_hist[-seq_len])
-    else:
-        actions_in = np.zeros(seq_len, dtype=np.int64)
-        if action_hist:
-            hist = action_hist[-(seq_len - 1) :]
-            actions_in[-len(hist) :] = hist
-            if len(action_hist) >= seq_len:
-                actions_in[0] = int(action_hist[-seq_len])
-
-    prev_equity = float(last_log.get("equity", cfg["backtest"]["initial_cash"])) if last_log is not None else float(
-        cfg["backtest"]["initial_cash"]
-    )
-    max_equity = prev_equity
-    if os.path.exists(log_path):
-        log_df = pd.read_csv(log_path)
-        if not log_df.empty and "equity" in log_df.columns:
-            max_equity = max(max_equity, float(log_df["equity"].max()))
-
-    prev_row = None
-    if last_log is not None:
-        last_ts = int(last_log.get("timestamp", 0))
-        match = feat_df[feat_df["timestamp"] == last_ts]
-        if not match.empty:
-            prev_row = match.iloc[-1]
-    if prev_row is None and len(feat_df) >= 2:
-        prev_row = feat_df.iloc[-2]
-
-    current_reward = 0.0
-    if last_log is not None:
-        if prev_row is not None and "close" in prev_row:
-            prev_close = float(prev_row["close"])
-        else:
-            prev_close = float(last_log.get("close", last_row["close"]))
-        prev_action = float(last_log.get("action", 0.0))
-        prev_prev_action = float(action_hist[-2]) if len(action_hist) >= 2 else 0.0
-        open_t = float(prev_row["open"]) if prev_row is not None and "open" in prev_row else None
-        high_t = float(prev_row["high"]) if prev_row is not None and "high" in prev_row else None
-        low_t = float(prev_row["low"]) if prev_row is not None and "low" in prev_row else None
-        open_t1 = float(last_row.get("open")) if "open" in last_row else None
-        high_t1 = float(last_row.get("high")) if "high" in last_row else None
-        low_t1 = float(last_row.get("low")) if "low" in last_row else None
-        current_reward, _, _, _ = compute_step_reward(
-            float(prev_action),
-            float(prev_prev_action),
-            float(prev_close),
-            float(last_row["close"]),
-            reward_fee,
-            reward_slip,
-            reward_scale=reward_scale,
-            turnover_penalty=turnover_penalty,
-            position_penalty=position_penalty,
-            drawdown_penalty=drawdown_penalty,
-            equity=prev_equity,
-            max_equity=max_equity,
-            price_mode=price_mode,
-            open_t=open_t,
-            high_t=high_t,
-            low_t=low_t,
-            open_t1=open_t1,
-            high_t1=high_t1,
-            low_t1=low_t1,
-            range_penalty=range_penalty,
+    # 4. 计算当前步奖励 (Current Reward) 用于更新 RTG
+    last_r, cur_r = 0.0, 0.0
+    if not logs.empty:
+        pr = (
+            feat[feat["timestamp"] == int(logs.iloc[-1]["timestamp"])].iloc[-1]
+            if not logs.empty
+            else feat.iloc[-2]
+        )
+        # 计算上一动作在当前产生的盈亏
+        rw_cfg = cfg["rl"]
+        cur_r, _, _, _ = compute_step_reward(
+            float(p_act),
+            float(acts[-2] if len(acts) > 1 else 0),
+            float(pr["close"]),
+            float(row["close"]),
+            fee,
+            slip,
+            reward_scale=float(rw_cfg.get("reward_scale", 1)),
+            turnover_penalty=float(rw_cfg.get("turnover_penalty", 0)),
+            position_penalty=float(rw_cfg.get("position_penalty", 0)),
+            drawdown_penalty=float(rw_cfg.get("drawdown_penalty", 0)),
+            equity=p_eq,
+            max_equity=logs["equity"].max() if "equity" in logs else p_eq,
+            price_mode=cfg["rewards"].get("price_mode", "close"),
+            open_t=float(pr["open"]),
+            high_t=float(pr["high"]),
+            low_t=float(pr["low"]),
+            open_t1=float(row["open"]),
+            high_t1=float(row["high"]),
+            low_t1=float(row["low"]),
         )
 
-    rtg_values = [float(target_return)]
-    current_rtg = float(target_return)
-    for past_reward in reward_hist:
-        current_rtg = update_rtg(current_rtg, past_reward, gamma)
-        rtg_values.append(current_rtg)
-    current_rtg = update_rtg(current_rtg, current_reward, gamma)
-    rtg_values.append(current_rtg)
+    # 5. RTG (Return-to-Go) 更新
+    ds = cfg["dataset"]
+    rtg = float(ds.get("target_return", 0))
+    for r in logs["reward"].values[-sl:]:
+        rtg = update_rtg(rtg, r, float(ds.get("rtg_gamma", 1.0)))
+    rtg = update_rtg(rtg, cur_r, float(ds.get("rtg_gamma", 1.0))) / float(
+        ds.get("rtg_scale", 1)
+    )
 
-    rtg_window = np.zeros(seq_len, dtype=np.float32)
-    tail = rtg_values[-seq_len:]
-    rtg_window[-len(tail) :] = tail
-    rtg_window = rtg_window / rtg_scale
+    # 6. 模型推理 (Inference)
+    # State
+    s = torch.tensor(
+        feat[cols].tail(sl).to_numpy(dtype=np.float32), device=dev
+    ).unsqueeze(0)
+    # RTG
+    r_in = torch.tensor(np.full(sl, rtg), dtype=torch.float32, device=dev).unsqueeze(0)
 
-    with torch.no_grad():
-        s = torch.tensor(state_window, device=device).unsqueeze(0)
-        r = torch.tensor(rtg_window, device=device).unsqueeze(0)
-        if action_mode == "continuous":
-            a = torch.tensor(actions_in, device=device).unsqueeze(0)
-            logits = model(s, a, r)
-            model_action = float(torch.tanh(logits[0, -1]).cpu().numpy().item())
-        else:
-            a = torch.tensor(action_to_index(actions_in), device=device).unsqueeze(0)
-            logits = model(s, a, r)
-            action_idx = int(torch.argmax(logits[0, -1]).item())
-            model_action = float(index_to_action(action_idx))
-
-    model_action = float(np.clip(model_action, -1.0, 1.0))
-    features_hash = hashlib.sha256(state_window[-1].tobytes()).hexdigest()
-    dry_run = cfg["papertrade"]["dry_run"]
-
-    current_qty = 0.0
-    order_resp = None
-    order_side = ""
-    error = ""
-
-    if dry_run:
-        if last_log is not None:
-            current_qty = float(last_log.get("position_qty", 0.0))
+    if act_mode == "continuous":
+        a_in = torch.tensor(
+            np.pad(acts[:-1, None], ((1, 0), (0, 0))), dtype=torch.float32, device=dev
+        ).unsqueeze(0)
+        logit = model(s, a_in, r_in)
+        mod_act = float(torch.tanh(logit[0, -1]).item())
     else:
-        try:
-            current_qty = client.get_position_qty(cfg["papertrade"]["symbol"])
-        except Exception as exc:
-            error = f"position_fetch_failed: {exc}"
+        a_in = torch.tensor(
+            to_act_idx(np.pad(acts[:-1], (1, 0))), dtype=torch.long, device=dev
+        ).unsqueeze(0)
+        logit = model(s, a_in, r_in)
+        mod_act = float(from_act_idx(torch.argmax(logit[0, -1]).item()))
 
-    prev_action = float(last_log.get("action", 0.0)) if last_log is not None else 0.0
-    prev_entry = float(last_log.get("entry_price", 0.0)) if last_log is not None else 0.0
-    prev_qty = float(last_log.get("position_qty", 0.0)) if last_log is not None else 0.0
-    prev_sign = float(np.sign(prev_qty)) if prev_qty != 0.0 else float(np.sign(prev_action))
-
-    equity_before = compute_equity(
-        last_log,
-        float(last_row["close"]),
-        float(prev_action),
-        cfg["rewards"]["fee"],
-        cfg["rewards"]["slip"],
-        cfg["backtest"]["initial_cash"],
-    )
-    peak_equity = max(max_equity, equity_before)
-    max_dd = float(cfg["papertrade"]["max_drawdown_pct"])
-    halted = peak_equity > 0 and equity_before < peak_equity * (1.0 - max_dd)
-
-    stop_loss_pct = float(cfg.get("papertrade", {}).get("stop_loss_pct", 0.0))
-    risk_reason = ""
-    final_action = model_action
-
-    if prev_sign != 0.0 and prev_entry > 0.0 and stop_loss_pct > 0.0:
-        last_close = float(last_row["close"])
-        if prev_sign > 0 and last_close <= prev_entry * (1.0 - stop_loss_pct):
-            final_action = 0.0
-            risk_reason = "stop_loss"
-        elif prev_sign < 0 and last_close >= prev_entry * (1.0 + stop_loss_pct):
-            final_action = 0.0
-            risk_reason = "stop_loss"
-
-    if halted:
-        final_action = 0.0
-        if not risk_reason:
-            risk_reason = "kill_switch"
-
-    equity = compute_equity(
-        last_log,
-        float(last_row["close"]),
-        float(final_action),
-        cfg["rewards"]["fee"],
-        cfg["rewards"]["slip"],
-        cfg["backtest"]["initial_cash"],
+    # 7. 风险控制与熔断 (Kill Switch)
+    dry, sym = cfg["papertrade"]["dry_run"], cfg["papertrade"]["symbol"]
+    cur_qty = (
+        client.pos(sym)
+        if not dry
+        else float(logs.iloc[-1]["position_qty"] if not logs.empty else 0)
     )
 
-    target_qty = compute_target_qty(
-        cfg,
-        final_action,
-        float(last_row["close"]),
-        float(equity_before),
-    )
-
-    delta = target_qty - current_qty
-    if not error:
-        if abs(delta) > 0:
-            order_side = "BUY" if delta > 0 else "SELL"
-            if dry_run:
-                current_qty = target_qty
-            else:
-                try:
-                    order_resp = client.place_order(cfg["papertrade"]["symbol"], order_side, abs(delta))
-                    current_qty = client.get_position_qty(cfg["papertrade"]["symbol"])
-                except Exception as exc:
-                    error = f"order_failed: {exc}"
-
-    entry_price = 0.0
-    if final_action != 0.0:
-        if prev_sign != 0.0 and np.sign(final_action) == prev_sign and prev_entry > 0.0:
-            entry_price = prev_entry
-        else:
-            entry_price = float(last_row["close"])
-
-    stop_price = 0.0
-    if entry_price > 0.0 and stop_loss_pct > 0.0:
-        if final_action > 0:
-            stop_price = entry_price * (1.0 - stop_loss_pct)
-        elif final_action < 0:
-            stop_price = entry_price * (1.0 + stop_loss_pct)
-
-    if error:
-        status = "ERROR"
-    elif halted:
-        status = "HALTED"
-    elif risk_reason == "stop_loss":
-        status = "STOP_LOSS"
-    else:
-        status = "OK"
-
-    log_row = {
-        "timestamp": last_timestamp,
-        "close": float(last_row["close"]),
-        "model_action": float(model_action),
-        "action": float(final_action),
-        "target_position": float(final_action),
-        "position": float(final_action),
-        "target_qty": float(target_qty),
-        "position_qty": float(current_qty),
-        "entry_price": float(entry_price),
-        "stop_price": float(stop_price),
-        "risk_reason": risk_reason,
-        "order_side": order_side,
-        "equity": equity,
-        "features_hash": features_hash,
-        "logits": json.dumps(logits[0, -1].tolist()),
-        "status": status,
-        "error": error,
-        "dry_run": dry_run,
-    }
-    log_row["reward"] = float(current_reward)
-    log_row["rtg"] = float(current_rtg)
-
-    monitor_and_alert(cfg, log_path, state_window, state_cols, log_row, recent_logs)
-    append_log(log_path, log_row)
-
-    if order_resp is not None:
-        resp_path = log_path.replace("trade_log.csv", "last_order.json")
-        save_json(resp_path, order_resp)
-
-
-def run_cycle(cfg, model, device, log_path, client):
-    lookback = compute_lookback(cfg)
-    df = client.get_klines(
-        cfg["papertrade"]["symbol"], cfg["papertrade"]["interval"], lookback
-    )
-    run_decision(cfg, model, device, log_path, client, df)
-
-
-def run_stream(cfg, model, device, log_path, client):
-    if websocket is None:
-        raise RuntimeError("websocket-client is not installed; install requirements.txt first")
-
-    symbol = cfg["papertrade"]["symbol"]
-    interval = cfg["papertrade"]["interval"]
-    use_closed_only = bool(cfg.get("papertrade", {}).get("ws_closed_only", True))
-    reconnect_seconds = float(cfg.get("papertrade", {}).get("ws_reconnect_seconds", 5))
-
-    lookback = compute_lookback(cfg)
-    df = client.get_klines(symbol, interval, lookback)
-    buffer = RollingOHLCVBuffer(df, max_len=lookback)
-
-    stream = f"{symbol.lower()}@kline_{interval}"
-    ws_url = build_ws_url(get_ws_base_url(cfg), stream)
-    last_timestamp = None
-
-    while True:
-        ws = None
-        try:
-            ws = websocket.create_connection(ws_url, timeout=30)
-            while True:
-                message = ws.recv()
-                if message is None:
-                    continue
-                parsed = parse_kline_message(message)
-                if not parsed:
-                    continue
-                if use_closed_only and not parsed["closed"]:
-                    continue
-                bar = parsed["bar"]
-                buffer.update(bar)
-                ts = int(bar["timestamp"])
-                if last_timestamp is not None and ts == last_timestamp:
-                    continue
-                last_timestamp = ts
-                run_decision(cfg, model, device, log_path, client, buffer.df)
-        except Exception as exc:
-            append_log(
-                log_path,
-                {
-                    "timestamp": int(time.time() * 1000),
-                    "status": "ERROR",
-                    "error": f"websocket_error: {exc}",
-                },
+    # 估算当前权益，检查是否触发最大回撤熔断
+    eq_now = p_eq * (
+        1.0
+        + p_act
+        * (
+            row["close"]
+            / float(
+                logs.iloc[-1].get("close", row["close"])
+                if not logs.empty
+                else row["close"]
             )
-            time.sleep(reconnect_seconds)
-        finally:
-            if ws is not None:
+            - 1.0
+        )
+    )
+    max_eq = max(eq_now, logs["equity"].max() if not logs.empty else eq_now)
+    halt = eq_now < max_eq * (
+        1.0 - float(cfg["papertrade"].get("max_drawdown_pct", 1.0))
+    )
+
+    fin_act, note = (0.0, "kill_switch") if halt else (np.clip(mod_act, -1, 1), "")
+
+    # 8. 仓位管理 (Sizing)
+    sz = cfg["papertrade"]["position_sizing"]
+    base = float(sz.get("fixed_qty", 0.001))
+    if sz.get("mode") == "fixed_notional":
+        base = float(sz["fixed_notional"]) / row["close"]
+    elif sz.get("mode") == "equity_fraction":
+        base = eq_now * float(sz["equity_fraction"]) / row["close"]
+    tgt_qty = fin_act * min(
+        max(base, float(sz.get("min_qty", 0))), float(sz.get("max_qty", 1e9))
+    )
+
+    # 9. 执行交易 (Execution)
+    err, ord_res = "", None
+    delta = tgt_qty - cur_qty
+    step_size = float(cfg["papertrade"].get("step_size", 0.001) or 0.001)
+    qty_to_order = round_step_size(abs(delta), step_size)
+    min_qty = float(sz.get("min_qty", 0.0))
+    if not dry and qty_to_order >= min_qty and qty_to_order > 0:
+        try:
+            ord_res = client.order(
+                sym, "BUY" if delta > 0 else "SELL", qty_to_order
+            )
+            cur_qty = client.pos(sym)
+        except Exception as e:
+            err = f"order_fail: {e}"
+    elif dry:
+        cur_qty = tgt_qty
+
+    # 10. 记录日志
+    l_row = {
+        "timestamp": ts,
+        "close": float(row["close"]),
+        "model_action": mod_act,
+        "action": fin_act,
+        "target_qty": tgt_qty,
+        "position_qty": cur_qty,
+        "equity": eq_now,
+        "reward": cur_r,
+        "rtg": rtg * float(ds.get("rtg_scale", 1)),
+        "status": "ERROR" if err else ("HALTED" if halt else "OK"),
+        "error": err,
+        "dry_run": dry,
+    }
+
+    monitor(cfg, path, s.cpu().numpy()[0], cols, l_row, logs)
+    log_csv(path, l_row)
+    if ord_res:
+        save_json(path.replace(".csv", "_ord.json"), ord_res)
+
+
+def run(cfg, model, dev, path, client, loop=False):
+    lb = get_lookback(cfg)
+    if loop and cfg["papertrade"].get("use_websocket"):
+        if not websocket:
+            raise ImportError("pip install websocket-client")
+        buf = RollingBuffer(
+            client.klines(
+                cfg["papertrade"]["symbol"], cfg["papertrade"]["interval"], lb
+            ),
+            lb,
+        )
+        url = f"{get_ws_base_url(cfg)}/ws/{cfg['papertrade']['symbol'].lower()}@kline_{cfg['papertrade']['interval']}"
+
+        def get_ws_base_url(cfg):
+            return (
+                "wss://stream.binancefuture.com"
+                if "testnet" in cfg["papertrade"]["base_url"]
+                else "wss://fstream.binance.com"
+            )
+
+        while True:
+            try:
+                ws = websocket.create_connection(url, timeout=30)
+                while True:
+                    msg = ws.recv()
+                    if not msg:
+                        continue
+                    k = json.loads(msg).get("k")
+                    if not k or (
+                        cfg["papertrade"].get("ws_closed_only", True) and not k.get("x")
+                    ):
+                        continue
+                    buf.update(
+                        {
+                            "timestamp": int(k["t"]),
+                            "open": float(k["o"]),
+                            "high": float(k["h"]),
+                            "low": float(k["l"]),
+                            "close": float(k["c"]),
+                            "volume": float(k["v"]),
+                        }
+                    )
+                    run_decision(cfg, model, dev, path, client, buf.df)
+            except Exception as e:
+                log_csv(
+                    path,
+                    {
+                        "timestamp": int(time.time() * 1000),
+                        "status": "ERROR",
+                        "error": f"ws_err: {e}",
+                    },
+                )
+                time.sleep(float(cfg["papertrade"].get("ws_reconnect_seconds", 5)))
+                try:
+                    buf = RollingBuffer(
+                        client.klines(
+                            cfg["papertrade"]["symbol"],
+                            cfg["papertrade"]["interval"],
+                            lb,
+                        ),
+                        lb,
+                    )
+                except Exception as be:
+                    log_csv(path, {"status": "ERROR", "error": f"backfill_err: {be}"})
+            finally:
                 try:
                     ws.close()
-                except Exception:
+                except:
                     pass
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="config.yaml")
-    parser.add_argument("--ckpt", required=True)
-    parser.add_argument("--loop", action="store_true")
-    args = parser.parse_args()
-
-    cfg = load_config(args.config)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = load_checkpoint(args.ckpt).to(device)
-    client = create_client(cfg)
-
-    log_path = cfg["papertrade"]["log_path"]
-    ensure_dir(os.path.dirname(log_path))
-
-    if args.loop:
-        if cfg.get("papertrade", {}).get("use_websocket", False):
-            run_stream(cfg, model, device, log_path, client)
-        else:
-            while True:
-                run_cycle(cfg, model, device, log_path, client)
-                time.sleep(cfg["papertrade"]["poll_seconds"])
     else:
-        run_cycle(cfg, model, device, log_path, client)
+        while True:
+            run_decision(
+                cfg,
+                model,
+                dev,
+                path,
+                client,
+                client.klines(
+                    cfg["papertrade"]["symbol"], cfg["papertrade"]["interval"], lb
+                ),
+            )
+            if not loop:
+                break
+            time.sleep(cfg["papertrade"]["poll_seconds"])
 
 
 if __name__ == "__main__":
-    main()
+    p = argparse.ArgumentParser()
+    p.add_argument("--config", default="config.yaml")
+    p.add_argument("--ckpt", required=True)
+    p.add_argument("--loop", action="store_true")
+    a = p.parse_args()
+    c = load_config(a.config)
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    run(
+        c,
+        load_ckpt(a.ckpt, dev),
+        dev,
+        c["papertrade"]["log_path"],
+        BinanceClient(c),
+        a.loop,
+    )
